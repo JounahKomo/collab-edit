@@ -3,33 +3,13 @@ use std::io::{self, Write, Read};
 use std::net::TcpStream;
 
 fn main() -> io::Result<()> {
-    
-    let address = "www.aalto.fi:80";
 
-    let mut stream = TcpStream::connect(address)?;
+    let mut stream = TcpStream::connect("pronets1.dice.aalto.fi:80")?;
 
-    println!("Connected to {}", address);
-
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input).unwrap();
-
-    let message = "GET /index.html HTTP/1.1\r\nHost: www.aalto.fi\r\n\r\n";
-
-    stream.write_all(message.as_bytes())?;
-
-    println!("Sent request: {}", message);
-
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
-
-    println!("Received response: {}", response);
-
-    stream = TcpStream::connect("pronets1.dice.aalto.fi:80")?;
-
-    let json = r#"{"name": "komonej1","git-repo": "git@version.aalto.fi:komonej1/pns-project-joona-komonen.git"}"#;
+    let json = r#"{"name": "komonej1","git-repo": "git@version.aalto.fi:komonej1/pns-project-joona-komonen.git","ports": "5015","protocol": "base-1"}"#;
 
     let new_message = format!(
-    "POST /fetch-git HTTP/1.1\r\n\
+    "POST /run-docker HTTP/1.1\r\n\
     Host: pronets1.dice.aalto.fi\r\n\
     Content-Type: application/json\r\n\
     Content-Length: {}\r\n\
