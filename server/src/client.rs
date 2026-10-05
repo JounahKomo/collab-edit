@@ -9,6 +9,14 @@ use std::{
 };
 
 use tracing::{error, warn};
+use serde::Serialize;
+
+#[derive(Debug, Default, Serialize)]
+pub struct ServerMetrics {
+    pub connections_total: u64,
+    pub messages_received: u64,
+    pub errors: u64,
+}
 
 pub struct Client {
     pub socket: TcpStream,
@@ -33,7 +41,7 @@ impl Client {
         }
     }
 
-	pub fn process_messages(&mut self, clients: &mut HashMap<Token, Client>) {
+	pub fn process_messages(&mut self, clients: &mut HashMap<Token, Client>, metrics: &mut ServerMetrics) {
 		loop {
 			if self.read_buf.len() < 4 { break; }
 			let len = u32::from_be_bytes(self.read_buf[..4].try_into().unwrap()) as usize;
@@ -53,7 +61,30 @@ impl Client {
 			let msg_type = &msg_bytes[8..12];
 			let payload = &msg_bytes[12..];
 
+			metrics.messages_received += 1;
+
 			match msg_type {
+				b"MET" => {
+		        	match serde_json::to_string(metrics) {
+                    	Ok(metrics_json) => {
+                        	let json_bytes = metrics_json.as_bytes();
+                            let response_len = (12 + json_bytes.len()) as u32;
+
+                            let mut met_msg = Vec::with_capacity(response_len as usize);
+                            met_msg.extend_from_slice(&response_len.to_be_bytes());
+                            met_msg.extend_from_slice(&msg_id.to_be_bytes());
+                            met_msg.extend_from_slice(b"MET ");
+                            met_msg.extend_from_slice(json_bytes);
+
+                            self.write_buf.extend_from_slice(&met_msg);
+                        }
+                        Err(e) => {
+                            error!("Failed to serialize metrics: {}", e);
+                            metrics.errors += 1;
+                            self.write_buf.extend_from_slice(&create_error(msg_id, "Internal error serializing metrics"));
+                        }
+                    }
+                }
 				b"TST " => {
 					self.write_buf.extend_from_slice(&msg_bytes);
 				}
@@ -70,6 +101,10 @@ impl Client {
 							self.username = Some(requested_usr);
 							self.write_buf.extend_from_slice(&msg_bytes);
 						}
+					} else {
+						self.write_buf.extend_from_slice(&create_error(msg_id, "Invalid UTF-8 in username"));
+                        warn!("Invalid UTF-8 in USR payload");
+                        metrics.errors += 1;
 					}
 				}
 				b"MSG " => {
@@ -78,6 +113,7 @@ impl Client {
 						None => {
 							self.write_buf.extend_from_slice(&create_error(msg_id, "Not registered. Send USR first."));
 							warn!("Tried to send MSG without username");
+							metrics.errors += 1;
 							continue;
 						}
 					};
@@ -86,6 +122,7 @@ impl Client {
 						Ok(s) => s,
 						Err(err) => {
 							warn!("Failed parsing of payload: {}", err);
+							metrics.errors += 1;
 							continue;
 						}
 					};
@@ -94,6 +131,7 @@ impl Client {
 						if channel != "general" {
 							self.write_buf.extend_from_slice(&create_error(msg_id, "Unknown channel"));
 							warn!("Tried using invalid channel: {}", channel);
+							metrics.errors += 1;
 							continue;
 						}
 
@@ -139,6 +177,7 @@ impl Client {
 										Err(err) => { 
 											other_client.is_closed = true; 
 											error!("Failed writing to client: {}", err);
+											metrics.errors += 1;
 											break; 
 										}
 									}
@@ -149,6 +188,7 @@ impl Client {
 						// Errors still use the client's `msg_id` as requested by the spec
 						self.write_buf.extend_from_slice(&create_error(msg_id, "Invalid MSG syntax. Expected: <channel> <message>"));
 						warn!("MSG not according to protocol");
+						metrics.errors += 1;
 					}
 
 				}
@@ -156,6 +196,7 @@ impl Client {
 				_ => {
 					self.write_buf.extend_from_slice(&create_error(msg_id, "Unknown message type"));
 					warn!("Unknown message type");
+					metrics.errors += 1;
 				}
 			}
 		}

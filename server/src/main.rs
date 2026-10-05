@@ -11,12 +11,11 @@ use mio::{
 use tracing::{error, warn, info};
 use tracing_subscriber::EnvFilter;
 
-use server::client::Client;
+use server::client::{ServerMetrics, Client};
 
 const SERVER: Token = Token(0);
 
 fn main() -> io::Result<()> {
-
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
@@ -33,15 +32,21 @@ fn main() -> io::Result<()> {
 
     poll.registry()
         .register(&mut server, SERVER, Interest::READABLE)
-		.inspect_err(|e| error!("Registering poll failed: {e}"))?;
+        .inspect_err(|e| error!("Registering poll failed: {e}"))?;
 
     let mut clients: HashMap<Token, Client> = HashMap::new();
     let mut next_token_id = 1;
+    
+    // Initialize metrics
+    let mut metrics = ServerMetrics::default();
 
     info!("Server listening on {}", address);
 
     loop {
-        poll.poll(&mut events, None).inspect_err(|e| error!("Failed to poll events: {e})"))?;
+        poll.poll(&mut events, None).inspect_err(|e| {
+            error!("Failed to poll events: {e})");
+            metrics.errors += 1; // Track poll error
+        })?;
 
         for event in events.iter() {
             match event.token() {
@@ -51,12 +56,18 @@ fn main() -> io::Result<()> {
                             info!("Accepted connection from: {}", address);
                             let token = Token(next_token_id);
                             next_token_id += 1;
+                            
+                            metrics.connections_total += 1; // Track new connection
 
-                            poll.registry().register(
+                            if let Err(e) = poll.registry().register(
                                 &mut socket,
                                 token,
                                 Interest::READABLE,
-                            )?;
+                            ) {
+                                error!("Failed to register new client socket: {e}");
+                                metrics.errors += 1; // Track register error
+                                continue;
+                            }
 
                             clients.insert(token, Client::new(socket, address));
                         }
@@ -65,6 +76,7 @@ fn main() -> io::Result<()> {
                         }
                         Err(e) => {
                             error!("Error accepting connection: {e}");
+                            metrics.errors += 1; // Track accept error
                             break;
                         }
                     }
@@ -73,9 +85,10 @@ fn main() -> io::Result<()> {
                     let mut client = match clients.remove(&token) {
                         Some(c) => c,
                         None => {
-							warn!("No client found for token: {:#?}", token);
-							continue;
-						}
+                            warn!("No client found for token: {:#?}", token);
+                            metrics.errors += 1; // Track missing client error
+                            continue;
+                        }
                     };
 
                     let mut needs_write = false;
@@ -96,7 +109,8 @@ fn main() -> io::Result<()> {
                                 }
                                 Err(err) => {
                                     client.is_closed = true;
-									warn!("Failed reading from client: {}", err);
+                                    warn!("Failed reading from client: {}", err);
+                                    metrics.errors += 1; // Track read error
                                     break;
                                 }
                             }
@@ -104,7 +118,8 @@ fn main() -> io::Result<()> {
                     }
 
                     if !client.is_closed {
-                        client.process_messages(&mut clients);
+                        // Pass metrics into the message processor
+                        client.process_messages(&mut clients, &mut metrics);
                     }
 
                     if event.is_writable() || !client.write_buf.is_empty() {
@@ -123,7 +138,8 @@ fn main() -> io::Result<()> {
                                 }
                                 Err(err) => {
                                     client.is_closed = true;
-									warn!("Failed writing to client: {}", err);
+                                    warn!("Failed writing to client: {}", err);
+                                    metrics.errors += 1; // Track write error
                                     break;
                                 }
                             }
@@ -141,6 +157,7 @@ fn main() -> io::Result<()> {
 
                         if let Err(e) = poll.registry().reregister(&mut client.socket, token, interest) {
                             warn!("Failed to reregister client: {}", e);
+                            metrics.errors += 1; // Track reregister error
                         } else {
                             clients.insert(token, client);
                         }
