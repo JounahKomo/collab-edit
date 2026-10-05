@@ -175,3 +175,19 @@ pub fn create_error(id: u32, error: &str) -> Vec<u8> {
     error_vec
 }
 
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn error_creation_working() {
+		let id = 12345;
+		let error_message = "Very serious error";
+		let error_vec: Vec<u8> = create_error(id, error_message);
+		let len = error_vec.len();
+		assert_eq!(u32::from_be_bytes(error_vec[..4].try_into().unwrap()), len as u32);
+		assert_eq!(u32::from_be_bytes(error_vec[4..8].try_into().unwrap()), id);
+		assert_eq!(str::from_utf8(&error_vec[12..len]), Ok(error_message));
+	}
+
+}
