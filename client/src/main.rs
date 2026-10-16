@@ -6,7 +6,6 @@ use std::{
 };
 
 fn main() -> io::Result<()> {
-
     let args: Vec<String> = env::args().collect();
 
     if args.len() != 2 {
@@ -25,7 +24,7 @@ fn main() -> io::Result<()> {
     thread::spawn(move || {
         loop {
             let mut header = [0u8; 12];
-            
+
             // This blocks purely waiting for new data. It has NO timeouts.
             if read_stream.read_exact(&mut header).is_err() {
                 println!("\nDisconnected from server.");
@@ -38,13 +37,13 @@ fn main() -> io::Result<()> {
 
             let payload_len = length.saturating_sub(12);
             let mut payload = vec![0u8; payload_len];
-            
+
             if read_stream.read_exact(&mut payload).is_err() {
                 break;
             }
 
             let text = str::from_utf8(&payload).unwrap_or("<invalid utf-8>");
-            
+
             // \r clears your current line so incoming messages neatly display
             println!("\r[ID:{} {}] {}\n> ", id, msg_type, text);
             io::stdout().flush().unwrap();
@@ -53,7 +52,7 @@ fn main() -> io::Result<()> {
 
     // --- SEND LOOP (Main thread handles typing) ---
     let mut msg_id: u32 = 1;
-    
+
     loop {
         print!("> ");
         io::stdout().flush().unwrap();
@@ -77,9 +76,13 @@ fn main() -> io::Result<()> {
             continue;
         }
 
-		let current_id = msg_id;
-		msg_id = msg_id.wrapping_add(2);
-        let content = if args.len() > 1 { args[1..].join(" ") } else { String::new() };
+        let current_id = msg_id;
+        msg_id = msg_id.wrapping_add(2);
+        let content = if args.len() > 1 {
+            args[1..].join(" ")
+        } else {
+            String::new()
+        };
         let mut msg_type_str = args[0].to_uppercase();
         msg_type_str.push(' '); // E.g., "MSG "
 
@@ -96,6 +99,6 @@ fn main() -> io::Result<()> {
             break;
         }
     }
-    
+
     Ok(())
 }

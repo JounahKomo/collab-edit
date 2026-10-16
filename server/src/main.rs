@@ -3,21 +3,17 @@ use std::{
     io::{self, Read, Write},
 };
 
-use mio::{
-    net::TcpListener,
-    Events, Interest, Poll, Token,
-};
+use mio::{Events, Interest, Poll, Token, net::TcpListener};
 
-use tracing::{error, warn, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use server::client::{ServerMetrics, Client};
+use server::client::{Client, ServerMetrics};
 
 const SERVER: Token = Token(0);
 
 fn main() -> io::Result<()> {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -28,7 +24,8 @@ fn main() -> io::Result<()> {
     let mut events = Events::with_capacity(128);
 
     let address = "0.0.0.0:5015".parse().unwrap();
-    let mut server = TcpListener::bind(address).inspect_err(|e| error!("Failed to bind TCP listener to {address}: {e}"))?;
+    let mut server = TcpListener::bind(address)
+        .inspect_err(|e| error!("Failed to bind TCP listener to {address}: {e}"))?;
 
     poll.registry()
         .register(&mut server, SERVER, Interest::READABLE)
@@ -36,7 +33,7 @@ fn main() -> io::Result<()> {
 
     let mut clients: HashMap<Token, Client> = HashMap::new();
     let mut next_token_id = 1;
-    
+
     // Initialize metrics
     let mut metrics = ServerMetrics::default();
 
@@ -56,14 +53,13 @@ fn main() -> io::Result<()> {
                             info!("Accepted connection from: {}", address);
                             let token = Token(next_token_id);
                             next_token_id += 1;
-                            
+
                             metrics.connections_total += 1; // Track new connection
 
-                            if let Err(e) = poll.registry().register(
-                                &mut socket,
-                                token,
-                                Interest::READABLE,
-                            ) {
+                            if let Err(e) =
+                                poll.registry()
+                                    .register(&mut socket, token, Interest::READABLE)
+                            {
                                 error!("Failed to register new client socket: {e}");
                                 metrics.errors += 1; // Track register error
                                 continue;
@@ -155,7 +151,10 @@ fn main() -> io::Result<()> {
                             Interest::READABLE
                         };
 
-                        if let Err(e) = poll.registry().reregister(&mut client.socket, token, interest) {
+                        if let Err(e) =
+                            poll.registry()
+                                .reregister(&mut client.socket, token, interest)
+                        {
                             warn!("Failed to reregister client: {}", e);
                             metrics.errors += 1; // Track reregister error
                         } else {

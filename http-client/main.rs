@@ -6,7 +6,7 @@ fn main() -> io::Result<()> {
 
     let mut stream = TcpStream::connect("pronets1.dice.aalto.fi:80")?;
 
-    let json = r#"{"name": "komonej1","git-repo": "git@version.aalto.fi:komonej1/pns-project-joona-komonen.git","ports": "5015","protocol": "base-1"}"#;
+    let json = r#"{"name": "komonej1","git-repo": "git@version.aalto.fi:komonej1/pns-project-joona-komonen.git","ports": "5015","protocol": "base-3"}"#;
 
     let new_message = format!(
     "POST /run-docker HTTP/1.1\r\n\
