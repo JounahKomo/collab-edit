@@ -1,6 +1,5 @@
 use std::{
-    env,
-    io::{self, ErrorKind, Read, Write},
+    io::{self, Read, Write},
     net::TcpStream,
     str,
     sync::mpsc,
@@ -79,7 +78,7 @@ fn main() -> io::Result<()> {
         .recv_timeout(Duration::from_secs(2))
         .expect("Server timed out before responding");
 
-    let (len, id, msg_type, payload) = decode_message(response.clone());
+    let (_, _, msg_type, _) = decode_message(response.clone());
 
     if msg_type == String::from("ERR ") {
         println!("Server responded to invalid message type correctly");
