@@ -69,7 +69,7 @@ impl Client {
             metrics.messages_received += 1;
 
             match msg_type {
-                b"MET" => match serde_json::to_string(metrics) {
+                b"MET " => match serde_json::to_string(metrics) {
                     Ok(metrics_json) => {
                         let json_bytes = metrics_json.as_bytes();
                         let response_len = (12 + json_bytes.len()) as u32;
