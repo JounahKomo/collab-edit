@@ -1,18 +1,17 @@
-use std::{
-    collections::HashMap,
-    io::{self, Read, Write},
+use std::{io, net::SocketAddr};
+
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    sync::mpsc,
 };
-
-use mio::{Events, Interest, Poll, Token, net::TcpListener};
-
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use server::client::{Client, ServerMetrics};
+use server::client::{Client, ClientHandle, ClientId, SharedState};
 
-const SERVER: Token = Token(0);
-
-fn main() -> io::Result<()> {
+#[tokio::main]
+async fn main() -> io::Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     tracing_subscriber::fmt()
@@ -20,149 +19,87 @@ fn main() -> io::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let mut poll = Poll::new().inspect_err(|e| error!("Failed to create Poll: {e}"))?;
-    let mut events = Events::with_capacity(128);
-
-    let address = "0.0.0.0:5015".parse().unwrap();
-    let mut server = TcpListener::bind(address)
+    let address: SocketAddr = "0.0.0.0:5015".parse().unwrap();
+    let listener = TcpListener::bind(address)
+        .await
         .inspect_err(|e| error!("Failed to bind TCP listener to {address}: {e}"))?;
 
-    poll.registry()
-        .register(&mut server, SERVER, Interest::READABLE)
-        .inspect_err(|e| error!("Registering poll failed: {e}"))?;
-
-    let mut clients: HashMap<Token, Client> = HashMap::new();
-    let mut next_token_id = 1;
-
-    // Initialize metrics
-    let mut metrics = ServerMetrics::default();
+    let state = SharedState::default();
+    let mut next_client_id: ClientId = 1;
 
     info!("Server listening on {}", address);
 
     loop {
-        poll.poll(&mut events, None).inspect_err(|e| {
-            error!("Failed to poll events: {e})");
-            metrics.errors += 1; // Track poll error
-        })?;
+        match listener.accept().await {
+            Ok((socket, peer)) => {
+                info!("Accepted connection from: {}", peer);
+                let id = next_client_id;
+                next_client_id += 1;
 
-        for event in events.iter() {
-            match event.token() {
-                SERVER => loop {
-                    match server.accept() {
-                        Ok((mut socket, address)) => {
-                            info!("Accepted connection from: {}", address);
-                            let token = Token(next_token_id);
-                            next_token_id += 1;
+                state.lock().metrics.connections_total += 1;
 
-                            metrics.connections_total += 1; // Track new connection
-
-                            if let Err(e) =
-                                poll.registry()
-                                    .register(&mut socket, token, Interest::READABLE)
-                            {
-                                error!("Failed to register new client socket: {e}");
-                                metrics.errors += 1; // Track register error
-                                continue;
-                            }
-
-                            clients.insert(token, Client::new(socket, address));
-                        }
-                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            break;
-                        }
-                        Err(e) => {
-                            error!("Error accepting connection: {e}");
-                            metrics.errors += 1; // Track accept error
-                            break;
-                        }
-                    }
-                },
-                token => {
-                    let mut client = match clients.remove(&token) {
-                        Some(c) => c,
-                        None => {
-                            warn!("No client found for token: {:#?}", token);
-                            metrics.errors += 1; // Track missing client error
-                            continue;
-                        }
-                    };
-
-                    let mut needs_write = false;
-
-                    if event.is_readable() {
-                        let mut buf = [0; 4096];
-                        loop {
-                            match client.socket.read(&mut buf) {
-                                Ok(0) => {
-                                    client.is_closed = true;
-                                    break;
-                                }
-                                Ok(n) => {
-                                    client.read_buf.extend_from_slice(&buf[..n]);
-                                }
-                                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                    break;
-                                }
-                                Err(err) => {
-                                    client.is_closed = true;
-                                    warn!("Failed reading from client: {}", err);
-                                    metrics.errors += 1; // Track read error
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    if !client.is_closed {
-                        // Pass metrics into the message processor
-                        client.process_messages(&mut clients, &mut metrics);
-                    }
-
-                    if event.is_writable() || !client.write_buf.is_empty() {
-                        while !client.write_buf.is_empty() {
-                            match client.socket.write(&client.write_buf) {
-                                Ok(0) => {
-                                    client.is_closed = true;
-                                    break;
-                                }
-                                Ok(n) => {
-                                    client.write_buf.drain(..n);
-                                }
-                                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                    needs_write = true;
-                                    break;
-                                }
-                                Err(err) => {
-                                    client.is_closed = true;
-                                    warn!("Failed writing to client: {}", err);
-                                    metrics.errors += 1; // Track write error
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    if client.is_closed {
-                        info!("Connection closed: {}", client.address);
-                    } else {
-                        let interest = if needs_write || !client.write_buf.is_empty() {
-                            Interest::READABLE | Interest::WRITABLE
-                        } else {
-                            Interest::READABLE
-                        };
-
-                        if let Err(e) =
-                            poll.registry()
-                                .reregister(&mut client.socket, token, interest)
-                        {
-                            warn!("Failed to reregister client: {}", e);
-                            metrics.errors += 1; // Track reregister error
-                        } else {
-                            clients.insert(token, client);
-                        }
-                    }
+                // Small request/response frames: don't let Nagle delay them.
+                if let Err(e) = socket.set_nodelay(true) {
+                    warn!("Failed to set TCP_NODELAY for {peer}: {e}");
                 }
+
+                tokio::spawn(handle_connection(socket, peer, id, state.clone()));
+            }
+            Err(e) => {
+                error!("Error accepting connection: {e}");
+                state.lock().metrics.errors += 1;
+                // Avoid a hot loop on persistent errors such as running out of file descriptors.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
     }
+}
+
+async fn handle_connection(
+    mut socket: TcpStream,
+    address: SocketAddr,
+    id: ClientId,
+    state: SharedState,
+) {
+    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    state.lock().clients.insert(id, ClientHandle::new(tx));
+
+    let mut client = Client::new(id, address);
+
+    loop {
+        tokio::select! {
+            res = socket.read_buf(&mut client.read_buf) => match res {
+                Ok(0) => client.is_closed = true,
+                Ok(_) => {
+                    // The lock is held only for this synchronous call, never across an await.
+                    let mut guard = state.lock();
+                    client.process_messages(&mut guard);
+                }
+                Err(err) => {
+                    client.is_closed = true;
+                    warn!("Failed reading from client: {}", err);
+                    state.lock().metrics.errors += 1;
+                }
+            },
+            // Data broadcast by other connections.
+            Some(msg) = rx.recv() => client.write_buf.extend_from_slice(&msg),
+        }
+
+        // Flush everything pending, including responses queued before a close.
+        if !client.write_buf.is_empty() {
+            if let Err(err) = socket.write_all(&client.write_buf).await {
+                client.is_closed = true;
+                warn!("Failed writing to client: {}", err);
+                state.lock().metrics.errors += 1;
+            }
+            client.write_buf.clear();
+        }
+
+        if client.is_closed {
+            break;
+        }
+    }
+
+    state.lock().clients.remove(&id);
+    info!("Connection closed: {}", client.address);
 }
