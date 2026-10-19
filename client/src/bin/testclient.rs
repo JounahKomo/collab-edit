@@ -1,13 +1,22 @@
 use std::{
     io::{self, Read, Write},
     net::TcpStream,
-    str,
-    sync::mpsc,
+    process::ExitCode,
+    sync::{Arc, Barrier},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use clap::Parser;
+
+const TIMEOUT: Duration = Duration::from_secs(2);
+const MIN_CONNECTIONS: usize = 5;
+const BROADCAST_TEXT: &str = "Hello everyone!";
+
+/// Every message ID a connection uses in its own requests. IDs are
+/// connection-specific, and the server must allocate IDs for the messages it
+/// originates (broadcast MSG) that are not already in use on that connection.
+const CLIENT_IDS: [u32; 8] = [1, 3, 5, 7, 9, 11, 13, 15];
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -16,110 +25,322 @@ struct Args {
     addr: String,
 
     /// Server port to connect to
-    #[arg(short, long, default_value_t = 1234)]
+    #[arg(short, long, default_value_t = 5015)]
     port: u16,
 
-    /// Username to use in the chat
+    /// Username prefix; connection N registers as "<user><N>"
     #[arg(short, long, default_value = "User")]
     user: String,
+
+    /// Number of concurrent connections (at least 5)
+    #[arg(short, long, default_value_t = MIN_CONNECTIONS)]
+    connections: usize,
 }
 
-fn main() -> io::Result<()> {
+/// Outcome of one connection thread.
+struct Report {
+    index: usize,
+    username: String,
+    checks: Vec<(String, bool)>,
+    /// Total time from thread start to finish (work + waiting).
+    elapsed: Duration,
+    /// Time spent connecting and exchanging messages with the server.
+    work: Duration,
+    /// Time spent idle at barriers waiting for the other connections.
+    waiting: Duration,
+}
+
+impl Report {
+    fn check(&mut self, description: &str, passed: bool) {
+        self.checks.push((description.to_string(), passed));
+    }
+}
+
+fn main() -> ExitCode {
     let args = Args::parse();
+    let connections = args.connections.max(MIN_CONNECTIONS);
+    if connections != args.connections {
+        eprintln!("Using the minimum of {MIN_CONNECTIONS} connections");
+    }
 
     let address = format!("{}:{}", args.addr, args.port);
+    println!("Opening {connections} concurrent connections to {address}...");
 
-    let mut write_stream = TcpStream::connect(&address)?;
-    println!("Connecting to {}...", address);
+    // Every thread passes every barrier, even after a failure, so one broken
+    // connection can never deadlock the others.
+    let barrier = Arc::new(Barrier::new(connections));
+    let total_start = Instant::now();
 
-    let mut read_stream = write_stream.try_clone().expect("Failed to clone stream");
+    let handles: Vec<_> = (0..connections)
+        .map(|index| {
+            let address = address.clone();
+            let user_prefix = args.user.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                run_connection(index, connections, &address, &user_prefix, &barrier)
+            })
+        })
+        .collect();
 
-    let (tx, rx) = mpsc::channel();
+    let mut reports: Vec<Report> = handles
+        .into_iter()
+        .map(|h| h.join().expect("connection thread panicked"))
+        .collect();
+    let total_elapsed = total_start.elapsed();
+    reports.sort_by_key(|r| r.index);
 
-    // 4. Spawn the background reader thread
-    thread::spawn(move || {
-        let mut buffer = [0; 1024];
-        loop {
-            match read_stream.read(&mut buffer) {
-                Ok(0) => break, // Connection gracefully closed by server
-                Ok(n) => {
-                    // Extract the exact bytes read and send them to the channel
-                    let received_data = buffer[..n].to_vec();
-                    if tx.send(received_data).is_err() {
-                        // The receiver was dropped, safe to exit
-                        break;
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Failed to read from socket: {e}");
-                    break;
-                }
-            }
+    let mut all_passed = true;
+    for report in &reports {
+        println!(
+            "\n[connection {} / {}] total {:.3} ms = work {:.3} ms + barrier wait {:.3} ms",
+            report.index,
+            report.username,
+            ms(report.elapsed),
+            ms(report.work),
+            ms(report.waiting)
+        );
+        for (description, passed) in &report.checks {
+            all_passed &= *passed;
+            println!(
+                "  {} {}",
+                if *passed { "PASS" } else { "FAIL" },
+                description
+            );
         }
-    });
-
-    let tst_message = create_message(1, "TST ", "Testing");
-    write_stream.write_all(&tst_message)?;
-
-    let response = rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("Server timed out before responding");
-
-    if response == tst_message {
-        println!("Server is handling TST message correctly");
-    } else {
-        println!("Server is not handling the TST message correctly");
     }
 
-    let invalid_message = create_message(3, "BYE ", "Testing");
-    write_stream.write_all(&invalid_message)?;
+    println!(
+        "\nAll threads finished in {:.3} ms wall-clock: {}",
+        ms(total_elapsed),
+        if all_passed {
+            "ALL CHECKS PASSED"
+        } else {
+            "SOME CHECKS FAILED"
+        }
+    );
 
-    let response = rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("Server timed out before responding");
-
-    let (_, _, msg_type, _) = decode_message(response.clone());
-
-    if msg_type == String::from("ERR ") {
-        println!("Server responded to invalid message type correctly");
+    if all_passed {
+        ExitCode::SUCCESS
     } else {
-        println!("Server did not respond correctly to invalid message type");
+        ExitCode::FAILURE
     }
+}
 
-    let usr_message = create_message(5, "USR ", &args.user);
-    write_stream.write_all(&usr_message)?;
+fn run_connection(
+    index: usize,
+    total: usize,
+    address: &str,
+    user_prefix: &str,
+    barrier: &Barrier,
+) -> Report {
+    let start = Instant::now();
+    let username = format!("{user_prefix}{index}");
+    let first_username = format!("{user_prefix}0");
+    let mut report = Report {
+        index,
+        username: username.clone(),
+        checks: Vec::new(),
+        elapsed: Duration::ZERO,
+        work: Duration::ZERO,
+        waiting: Duration::ZERO,
+    };
 
-    let response = rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("Server timed out before responding");
+    let connect_start = Instant::now();
+    let mut stream = match connect(address) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            report.check(&format!("connect to server ({e})"), false);
+            None
+        }
+    };
+    report.work += connect_start.elapsed();
 
-    if response == usr_message {
-        println!("Server is handling USR message correctly");
-    } else {
-        println!("Server is not handling the USR message correctly");
+    // Runs one phase if the connection is still healthy, then waits for the
+    // other threads so that the phases line up across all connections.
+    let phase = |stream: &mut Option<TcpStream>,
+                 report: &mut Report,
+                 name: &str,
+                 body: &dyn Fn(&mut TcpStream, &mut Report) -> io::Result<()>,
+                 sync: bool| {
+        let work_start = Instant::now();
+        if let Some(s) = stream.as_mut()
+            && let Err(e) = body(s, report)
+        {
+            report.check(&format!("{name}: I/O error ({e})"), false);
+            *stream = None;
+        }
+        report.work += work_start.elapsed();
+
+        if sync {
+            let wait_start = Instant::now();
+            barrier.wait();
+            report.waiting += wait_start.elapsed();
+        }
+    };
+
+    let broadcaster = total - 1;
+
+    // Phase 1: basic message handling, plus use-case specific errors.
+    phase(
+        &mut stream,
+        &mut report,
+        "basic messages",
+        &|s, r| {
+            let tst = create_message(1, "TST ", "Testing");
+            s.write_all(&tst)?;
+            r.check("TST is echoed back", read_frame(s)? == tst);
+
+            s.write_all(&create_message(3, "BYE ", "Testing"))?;
+            let (_, id, ty, _) = decode_message(&read_frame(s)?);
+            r.check(
+                "unknown message type gets ERR with the same id",
+                ty == "ERR " && id == 3,
+            );
+
+            if index == 1 {
+                s.write_all(&create_message(5, "MSG ", "general too early"))?;
+                let (_, id, ty, _) = decode_message(&read_frame(s)?);
+                r.check(
+                    "MSG before USR gets ERR with the same id",
+                    ty == "ERR " && id == 5,
+                );
+            }
+            Ok(())
+        },
+        false,
+    );
+
+    // Phase 2: every connection registers a unique username.
+    phase(
+        &mut stream,
+        &mut report,
+        "registration",
+        &|s, r| {
+            let usr = create_message(7, "USR ", &username);
+            s.write_all(&usr)?;
+            r.check("USR is accepted and echoed", read_frame(s)? == usr);
+            Ok(())
+        },
+        true, // all users are registered after this point
+    );
+
+    // Phase 3: error use cases that need other registered users.
+    phase(
+        &mut stream,
+        &mut report,
+        "error cases",
+        &|s, r| {
+            if index == 2 {
+                s.write_all(&create_message(9, "USR ", &first_username))?;
+                let (_, id, ty, _) = decode_message(&read_frame(s)?);
+                r.check("duplicate username gets ERR", ty == "ERR " && id == 9);
+            }
+            if index == 3 {
+                s.write_all(&create_message(9, "MSG ", "nochannel Hi"))?;
+                let (_, id, ty, _) = decode_message(&read_frame(s)?);
+                r.check(
+                    "MSG to unknown channel gets ERR with the same id",
+                    ty == "ERR " && id == 9,
+                );
+
+                s.write_all(&create_message(11, "MSG ", "malformed"))?;
+                let (_, id, ty, _) = decode_message(&read_frame(s)?);
+                r.check(
+                    "MSG without <channel> <text> gets ERR with the same id",
+                    ty == "ERR " && id == 11,
+                );
+            }
+            Ok(())
+        },
+        true,
+    );
+
+    // Phase 4: one connection broadcasts, all the others must receive it.
+    let expected_payload = format!("{}{} general {}", user_prefix, broadcaster, BROADCAST_TEXT);
+    phase(
+        &mut stream,
+        &mut report,
+        "broadcast",
+        &|s, r| {
+            if index == broadcaster {
+                s.write_all(&create_message(
+                    13,
+                    "MSG ",
+                    &format!("general {BROADCAST_TEXT}"),
+                ))?;
+                let (len, id, ty, payload) = decode_message(&read_frame(s)?);
+                r.check(
+                    "MSG is echoed to the sender with a newly allocated server id",
+                    ty == "MSG "
+                        && !CLIENT_IDS.contains(&id)
+                        && payload == expected_payload
+                        && len as usize == 12 + payload.len(),
+                );
+            } else {
+                let (_, id, ty, payload) = decode_message(&read_frame(s)?);
+                r.check(
+                    "broadcast MSG from another user received",
+                    ty == "MSG " && !CLIENT_IDS.contains(&id) && payload == expected_payload,
+                );
+            }
+            Ok(())
+        },
+        true,
+    );
+
+    // Phase 5: server metrics.
+    phase(
+        &mut stream,
+        &mut report,
+        "metrics",
+        &|s, r| {
+            if index == 0 {
+                s.write_all(&create_message(15, "MET ", ""))?;
+                let (_, id, ty, payload) = decode_message(&read_frame(s)?);
+                r.check(
+                    "MET returns the metrics JSON",
+                    ty == "MET "
+                        && id == 15
+                        && payload.contains("\"connections_total\"")
+                        && payload.contains("\"messages_received\""),
+                );
+            }
+            Ok(())
+        },
+        false,
+    );
+
+    report.elapsed = start.elapsed();
+    report
+}
+
+fn ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+fn connect(address: &str) -> io::Result<TcpStream> {
+    let stream = TcpStream::connect(address)?;
+    stream.set_read_timeout(Some(TIMEOUT))?;
+    stream.set_write_timeout(Some(TIMEOUT))?;
+    stream.set_nodelay(true)?;
+    Ok(stream)
+}
+
+/// Reads exactly one length-prefixed frame from the stream.
+fn read_frame(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+    let mut len_bytes = [0u8; 4];
+    stream.read_exact(&mut len_bytes)?;
+    let len = u32::from_be_bytes(len_bytes) as usize;
+    if len < 12 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame shorter than header",
+        ));
     }
-
-    let msg_message = create_message(7, "MSG ", "general Hello world!");
-    write_stream.write_all(&msg_message)?;
-
-    let response = rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("Server timed out before responding");
-
-    let (response_len, _, response_type, response_payload) = decode_message(response);
-
-    let msg_type = "MSG " == response_type;
-    let usr = args.user + " ";
-    let payload = (usr.clone() + "general Hello world!") == response_payload;
-    let len = ((12 + "general Hello world!".len() + usr.len()) as u32) == response_len;
-
-    if msg_type && payload && len {
-        println!("Server is handling MSG message correctly");
-    } else {
-        println!("Server is not handling the MSG message correctly");
-    }
-
-    Ok(())
+    let mut frame = vec![0u8; len];
+    frame[..4].copy_from_slice(&len_bytes);
+    stream.read_exact(&mut frame[4..])?;
+    Ok(frame)
 }
 
 pub fn create_message(id: u32, msg_type: &str, payload: &str) -> Vec<u8> {
@@ -134,14 +355,11 @@ pub fn create_message(id: u32, msg_type: &str, payload: &str) -> Vec<u8> {
     message
 }
 
-pub fn decode_message(message: Vec<u8>) -> (u32, u32, String, String) {
+pub fn decode_message(message: &[u8]) -> (u32, u32, String, String) {
     let len = u32::from_be_bytes(message[..4].try_into().unwrap());
-
     let id = u32::from_be_bytes(message[4..8].try_into().unwrap());
-
-    let msg_type = String::from_utf8(message[8..12].to_vec()).unwrap();
-
-    let payload = String::from_utf8(message[12..(len as usize)].to_vec()).unwrap();
+    let msg_type = String::from_utf8_lossy(&message[8..12]).into_owned();
+    let payload = String::from_utf8_lossy(&message[12..(len as usize)]).into_owned();
 
     (len, id, msg_type, payload)
 }
