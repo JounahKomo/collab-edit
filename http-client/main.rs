@@ -1,23 +1,22 @@
-use std::io::{self, Write, Read};
+use std::io::{self, Read, Write};
 
 use std::net::TcpStream;
 
 fn main() -> io::Result<()> {
-
     let mut stream = TcpStream::connect("pronets1.dice.aalto.fi:80")?;
 
     let json = r#"{"name": "komonej1","git-repo": "git@version.aalto.fi:komonej1/pns-project-joona-komonen.git","ports": "5015","protocol": "base-3"}"#;
 
     let new_message = format!(
-    "POST /run-docker HTTP/1.1\r\n\
+        "POST /run-docker HTTP/1.1\r\n\
     Host: pronets1.dice.aalto.fi\r\n\
     Content-Type: application/json\r\n\
     Content-Length: {}\r\n\
     Connection: close\r\n\
     \r\n\
     {}",
-    json.len(),
-    json
+        json.len(),
+        json
     );
 
     stream.write_all(new_message.as_bytes())?;
@@ -30,5 +29,4 @@ fn main() -> io::Result<()> {
     println!("Received response: {}", response);
 
     Ok(())
-
 }
