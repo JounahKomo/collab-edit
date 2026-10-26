@@ -27,7 +27,7 @@ use server::client::{Client, ClientHandle, ClientId, SharedState};
 )]
 struct Cli {
     /// Port to listen on
-    #[arg(short, long, default_value_t = 5015, env = "PORT")]
+    #[arg(short, long, default_value_t = 5011, env = "PORT")]
     port: u16,
 
     /// Bind IP address

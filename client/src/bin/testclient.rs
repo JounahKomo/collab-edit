@@ -27,7 +27,7 @@ struct Args {
     addr: String,
 
     /// Server port to connect to
-    #[arg(short, long, default_value_t = 5015, env = "SERVER_PORT")]
+    #[arg(short, long, default_value_t = 5011, env = "SERVER_PORT")]
     port: u16,
 
     /// Username prefix; connection N registers as "<user><N>"

@@ -36,7 +36,7 @@ struct Args {
     git_repo: String,
 
     /// Exposed port(s) for the container
-    #[arg(long, default_value = "5015", env = "PORTS")]
+    #[arg(long, default_value = "5011", env = "PORTS")]
     ports: String,
 
     /// Protocol version
