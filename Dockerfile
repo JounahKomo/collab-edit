@@ -1,4 +1,4 @@
-FROM rust:1.96 AS builder
+FROM rust:1.96-bookworm AS builder
 
 WORKDIR /usr/src/pronets-app
 
