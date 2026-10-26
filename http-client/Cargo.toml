@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+rustls = "0.23"
+rustls-pki-types = "1"
+webpki-roots = "1"
+clap = { version = "4.6", features = ["derive", "env"] }

@@ -1,6 +1,8 @@
 use std::{
-    io::{self, Read, Write},
+    fs::File,
+    io::{self, BufReader, Read, Write},
     net::TcpStream,
+    path::{Path, PathBuf},
     process::ExitCode,
     sync::{Arc, Barrier},
     thread,
@@ -8,24 +10,24 @@ use std::{
 };
 
 use clap::Parser;
+use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
+use rustls_pki_types::ServerName;
 
-const TIMEOUT: Duration = Duration::from_secs(2);
+const TIMEOUT: Duration = Duration::from_secs(5);
 const MIN_CONNECTIONS: usize = 5;
 const BROADCAST_TEXT: &str = "Hello everyone!";
 
-/// Every message ID a connection uses in its own requests. IDs are
-/// connection-specific, and the server must allocate IDs for the messages it
-/// originates (broadcast MSG) that are not already in use on that connection.
+/// Every message ID a connection uses in its own requests.
 const CLIENT_IDS: [u32; 8] = [1, 3, 5, 7, 9, 11, 13, 15];
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 struct Args {
     /// Server host to connect to
-    #[arg(short, long, default_value = "127.0.0.1")]
+    #[arg(short, long, default_value = "127.0.0.1", env = "SERVER_ADDR")]
     addr: String,
 
     /// Server port to connect to
-    #[arg(short, long, default_value_t = 5015)]
+    #[arg(short, long, default_value_t = 5015, env = "SERVER_PORT")]
     port: u16,
 
     /// Username prefix; connection N registers as "<user><N>"
@@ -35,18 +37,26 @@ struct Args {
     /// Number of concurrent connections (at least 5)
     #[arg(short, long, default_value_t = MIN_CONNECTIONS)]
     connections: usize,
+
+    /// Path to custom Root CA certificate (.crt / .pem) for verifying the server
+    #[arg(long, env = "TLS_CA_CERT")]
+    ca_cert: Option<PathBuf>,
+
+    /// Server Name Indication (SNI) for TLS verification (defaults to addr if it's a domain, or 'localhost')
+    #[arg(long, env = "TLS_SERVER_NAME")]
+    server_name: Option<String>,
+
+    /// Connect with plain TCP instead of TLS
+    #[arg(long, env = "NO_TLS")]
+    no_tls: bool,
 }
 
-/// Outcome of one connection thread.
 struct Report {
     index: usize,
     username: String,
     checks: Vec<(String, bool)>,
-    /// Total time from thread start to finish (work + waiting).
     elapsed: Duration,
-    /// Time spent connecting and exchanging messages with the server.
     work: Duration,
-    /// Time spent idle at barriers waiting for the other connections.
     waiting: Duration,
 }
 
@@ -54,6 +64,10 @@ impl Report {
     fn check(&mut self, description: &str, passed: bool) {
         self.checks.push((description.to_string(), passed));
     }
+}
+
+fn ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
 }
 
 fn main() -> ExitCode {
@@ -64,10 +78,31 @@ fn main() -> ExitCode {
     }
 
     let address = format!("{}:{}", args.addr, args.port);
-    println!("Opening {connections} concurrent connections to {address}...");
+    println!(
+        "Opening {connections} concurrent connections to {address} (TLS: {})...",
+        if args.no_tls { "disabled" } else { "enabled" }
+    );
 
-    // Every thread passes every barrier, even after a failure, so one broken
-    // connection can never deadlock the others.
+    let tls_config = if args.no_tls {
+        None
+    } else {
+        match build_client_config(args.ca_cert.as_deref()) {
+            Ok(cfg) => Some(Arc::new(cfg)),
+            Err(e) => {
+                eprintln!("Failed to configure TLS client: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+
+    let sni_name = args.server_name.clone().unwrap_or_else(|| {
+        if args.addr.parse::<std::net::IpAddr>().is_ok() {
+            "localhost".to_string()
+        } else {
+            args.addr.clone()
+        }
+    });
+
     let barrier = Arc::new(Barrier::new(connections));
     let total_start = Instant::now();
 
@@ -76,8 +111,19 @@ fn main() -> ExitCode {
             let address = address.clone();
             let user_prefix = args.user.clone();
             let barrier = Arc::clone(&barrier);
+            let tls_config = tls_config.clone();
+            let sni_name = sni_name.clone();
+
             thread::spawn(move || {
-                run_connection(index, connections, &address, &user_prefix, &barrier)
+                run_connection(
+                    index,
+                    connections,
+                    &address,
+                    &user_prefix,
+                    &barrier,
+                    tls_config,
+                    &sni_name,
+                )
             })
         })
         .collect();
@@ -126,12 +172,95 @@ fn main() -> ExitCode {
     }
 }
 
+enum ConnectionStream {
+    Plain(TcpStream),
+    Tls(Box<StreamOwned<ClientConnection, TcpStream>>),
+}
+
+impl Read for ConnectionStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(s) => s.read(buf),
+            Self::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for ConnectionStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(s) => s.write(buf),
+            Self::Tls(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Plain(s) => s.flush(),
+            Self::Tls(s) => s.flush(),
+        }
+    }
+}
+
+fn build_client_config(ca_cert_path: Option<&Path>) -> io::Result<ClientConfig> {
+    let mut root_store = RootCertStore::empty();
+
+    if let Some(path) = ca_cert_path {
+        let file = File::open(path)?;
+        let mut reader = BufReader::new(file);
+        let certs = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
+        for cert in certs {
+            root_store
+                .add(cert)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        }
+    } else {
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+
+    let config = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    Ok(config)
+}
+
+fn connect(
+    address: &str,
+    tls_config: Option<Arc<ClientConfig>>,
+    sni_name: &str,
+) -> io::Result<ConnectionStream> {
+    let tcp_stream = TcpStream::connect(address)?;
+    tcp_stream.set_read_timeout(Some(TIMEOUT))?;
+    tcp_stream.set_write_timeout(Some(TIMEOUT))?;
+    tcp_stream.set_nodelay(true)?;
+
+    if let Some(config) = tls_config {
+        let server_name: ServerName<'static> = sni_name
+            .to_string()
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid SNI host name"))?;
+
+        let conn = ClientConnection::new(config, server_name)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+
+        let mut tls_stream = StreamOwned::new(conn, tcp_stream);
+        // Force initial TLS handshake
+        tls_stream.flush()?;
+        Ok(ConnectionStream::Tls(Box::new(tls_stream)))
+    } else {
+        Ok(ConnectionStream::Plain(tcp_stream))
+    }
+}
+
 fn run_connection(
     index: usize,
     total: usize,
     address: &str,
     user_prefix: &str,
     barrier: &Barrier,
+    tls_config: Option<Arc<ClientConfig>>,
+    sni_name: &str,
 ) -> Report {
     let start = Instant::now();
     let username = format!("{user_prefix}{index}");
@@ -146,7 +275,7 @@ fn run_connection(
     };
 
     let connect_start = Instant::now();
-    let mut stream = match connect(address) {
+    let mut stream = match connect(address, tls_config, sni_name) {
         Ok(s) => Some(s),
         Err(e) => {
             report.check(&format!("connect to server ({e})"), false);
@@ -155,12 +284,10 @@ fn run_connection(
     };
     report.work += connect_start.elapsed();
 
-    // Runs one phase if the connection is still healthy, then waits for the
-    // other threads so that the phases line up across all connections.
-    let phase = |stream: &mut Option<TcpStream>,
+    let phase = |stream: &mut Option<ConnectionStream>,
                  report: &mut Report,
                  name: &str,
-                 body: &dyn Fn(&mut TcpStream, &mut Report) -> io::Result<()>,
+                 body: &dyn Fn(&mut ConnectionStream, &mut Report) -> io::Result<()>,
                  sync: bool| {
         let work_start = Instant::now();
         if let Some(s) = stream.as_mut()
@@ -180,7 +307,7 @@ fn run_connection(
 
     let broadcaster = total - 1;
 
-    // Phase 1: basic message handling, plus use-case specific errors.
+    // Phase 1: basic message handling
     phase(
         &mut stream,
         &mut report,
@@ -188,9 +315,11 @@ fn run_connection(
         &|s, r| {
             let tst = create_message(1, "TST ", "Testing");
             s.write_all(&tst)?;
+            s.flush()?;
             r.check("TST is echoed back", read_frame(s)? == tst);
 
             s.write_all(&create_message(3, "BYE ", "Testing"))?;
+            s.flush()?;
             let (_, id, ty, _) = decode_message(&read_frame(s)?);
             r.check(
                 "unknown message type gets ERR with the same id",
@@ -199,6 +328,7 @@ fn run_connection(
 
             if index == 1 {
                 s.write_all(&create_message(5, "MSG ", "general too early"))?;
+                s.flush()?;
                 let (_, id, ty, _) = decode_message(&read_frame(s)?);
                 r.check(
                     "MSG before USR gets ERR with the same id",
@@ -210,7 +340,7 @@ fn run_connection(
         false,
     );
 
-    // Phase 2: every connection registers a unique username.
+    // Phase 2: registration
     phase(
         &mut stream,
         &mut report,
@@ -218,13 +348,14 @@ fn run_connection(
         &|s, r| {
             let usr = create_message(7, "USR ", &username);
             s.write_all(&usr)?;
+            s.flush()?;
             r.check("USR is accepted and echoed", read_frame(s)? == usr);
             Ok(())
         },
-        true, // all users are registered after this point
+        true,
     );
 
-    // Phase 3: error use cases that need other registered users.
+    // Phase 3: error use cases
     phase(
         &mut stream,
         &mut report,
@@ -232,11 +363,13 @@ fn run_connection(
         &|s, r| {
             if index == 2 {
                 s.write_all(&create_message(9, "USR ", &first_username))?;
+                s.flush()?;
                 let (_, id, ty, _) = decode_message(&read_frame(s)?);
                 r.check("duplicate username gets ERR", ty == "ERR " && id == 9);
             }
             if index == 3 {
                 s.write_all(&create_message(9, "MSG ", "nochannel Hi"))?;
+                s.flush()?;
                 let (_, id, ty, _) = decode_message(&read_frame(s)?);
                 r.check(
                     "MSG to unknown channel gets ERR with the same id",
@@ -244,6 +377,7 @@ fn run_connection(
                 );
 
                 s.write_all(&create_message(11, "MSG ", "malformed"))?;
+                s.flush()?;
                 let (_, id, ty, _) = decode_message(&read_frame(s)?);
                 r.check(
                     "MSG without <channel> <text> gets ERR with the same id",
@@ -255,8 +389,8 @@ fn run_connection(
         true,
     );
 
-    // Phase 4: one connection broadcasts, all the others must receive it.
-    let expected_payload = format!("{}{} general {}", user_prefix, broadcaster, BROADCAST_TEXT);
+    // Phase 4: broadcast
+    let expected_payload = format!("{user_prefix}{broadcaster} general {BROADCAST_TEXT}");
     phase(
         &mut stream,
         &mut report,
@@ -268,6 +402,7 @@ fn run_connection(
                     "MSG ",
                     &format!("general {BROADCAST_TEXT}"),
                 ))?;
+                s.flush()?;
                 let (len, id, ty, payload) = decode_message(&read_frame(s)?);
                 r.check(
                     "MSG is echoed to the sender with a newly allocated server id",
@@ -288,7 +423,7 @@ fn run_connection(
         true,
     );
 
-    // Phase 5: server metrics.
+    // Phase 5: metrics
     phase(
         &mut stream,
         &mut report,
@@ -296,6 +431,7 @@ fn run_connection(
         &|s, r| {
             if index == 0 {
                 s.write_all(&create_message(15, "MET ", ""))?;
+                s.flush()?;
                 let (_, id, ty, payload) = decode_message(&read_frame(s)?);
                 r.check(
                     "MET returns the metrics JSON",
@@ -314,20 +450,7 @@ fn run_connection(
     report
 }
 
-fn ms(duration: Duration) -> f64 {
-    duration.as_secs_f64() * 1000.0
-}
-
-fn connect(address: &str) -> io::Result<TcpStream> {
-    let stream = TcpStream::connect(address)?;
-    stream.set_read_timeout(Some(TIMEOUT))?;
-    stream.set_write_timeout(Some(TIMEOUT))?;
-    stream.set_nodelay(true)?;
-    Ok(stream)
-}
-
-/// Reads exactly one length-prefixed frame from the stream.
-fn read_frame(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+fn read_frame<R: Read>(stream: &mut R) -> io::Result<Vec<u8>> {
     let mut len_bytes = [0u8; 4];
     stream.read_exact(&mut len_bytes)?;
     let len = u32::from_be_bytes(len_bytes) as usize;
