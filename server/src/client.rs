@@ -8,6 +8,8 @@ use serde::Serialize;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{error, warn};
 
+use crate::document::Document;
+
 pub type ClientId = u64;
 
 #[derive(Debug, Default, Serialize)]
@@ -63,6 +65,7 @@ impl ClientHandle {
 pub struct State {
     pub clients: HashMap<ClientId, ClientHandle>,
     pub metrics: ServerMetrics,
+    pub document: Document,
 }
 
 /// Shared state handle. The lock is only ever held in synchronous code (never
@@ -99,7 +102,11 @@ impl Client {
     }
 
     pub fn process_messages(&mut self, state: &mut State) {
-        let State { clients, metrics } = state;
+        let State {
+            clients,
+            metrics,
+            document,
+        } = state;
 
         loop {
             if self.read_buf.len() < 4 {
@@ -212,28 +219,13 @@ impl Client {
                         // Format the broadcast: <Sender> <Channel> <Message>
                         let broadcast_payload =
                             format!("{} {} {}", sender_usr, channel, message_text);
-                        let payload_bytes = broadcast_payload.as_bytes();
-
-                        // Send the broadcast back to the sender using a SERVER allocated ID
-                        if let Some(me) = clients.get_mut(&self.id) {
-                            let sender_msg_id = me.take_server_msg_id();
-                            self.write_buf.extend_from_slice(&frame(
-                                sender_msg_id,
-                                b"MSG ",
-                                payload_bytes,
-                            ));
-                        }
-
-                        // Broadcast to all OTHER registered users; each one's task does the write.
-                        for (other_id, other) in clients.iter_mut() {
-                            if *other_id == self.id || other.username.is_none() {
-                                continue;
-                            }
-                            let other_msg_id = other.take_server_msg_id();
-                            let other_msg = frame(other_msg_id, b"MSG ", payload_bytes);
-                            // Err means the receiving task already ended; it will deregister itself.
-                            let _ = other.tx.send(other_msg);
-                        }
+                        broadcast_to_all(
+                            clients,
+                            self.id,
+                            &mut self.write_buf,
+                            b"MSG ",
+                            broadcast_payload.as_bytes(),
+                        );
                     } else {
                         // Errors still use the client's `msg_id` as requested by the spec
                         self.write_buf.extend_from_slice(&create_error(
@@ -242,6 +234,212 @@ impl Client {
                         ));
                         warn!("MSG not according to protocol");
                         metrics.errors += 1;
+                    }
+                }
+                b"GET " => {
+                    let is_registered = clients.get(&self.id).is_some_and(|c| c.username.is_some());
+                    if !is_registered {
+                        self.write_buf.extend_from_slice(&create_error(
+                            msg_id,
+                            "Not registered. Send USR first.",
+                        ));
+                        warn!("Tried to GET document without username");
+                        metrics.errors += 1;
+                        continue;
+                    }
+
+                    let doc_payload = format!("{}\n{}", document.revision, document.text());
+                    self.write_buf.extend_from_slice(&frame(
+                        msg_id,
+                        b"GET ",
+                        doc_payload.as_bytes(),
+                    ));
+                }
+                b"INS " => {
+                    let is_registered = clients.get(&self.id).is_some_and(|c| c.username.is_some());
+                    if !is_registered {
+                        self.write_buf.extend_from_slice(&create_error(
+                            msg_id,
+                            "Not registered. Send USR first.",
+                        ));
+                        warn!("Tried to INS without username");
+                        metrics.errors += 1;
+                        continue;
+                    }
+
+                    let payload_str = match std::str::from_utf8(payload) {
+                        Ok(s) => s,
+                        Err(err) => {
+                            warn!("Failed parsing of INS payload: {}", err);
+                            metrics.errors += 1;
+                            self.write_buf.extend_from_slice(&create_error(
+                                msg_id,
+                                "Invalid UTF-8 in INS payload",
+                            ));
+                            continue;
+                        }
+                    };
+
+                    let (line_str, rest) = match payload_str.split_once(' ') {
+                        Some(pair) => pair,
+                        None => {
+                            self.write_buf.extend_from_slice(&create_error(
+                                msg_id,
+                                "Invalid INS syntax. Expected: <line> <col> <text>",
+                            ));
+                            warn!("INS invalid syntax");
+                            metrics.errors += 1;
+                            continue;
+                        }
+                    };
+
+                    let (col_str, text_to_insert) = match rest.split_once(' ') {
+                        Some(pair) => pair,
+                        None => (rest, ""),
+                    };
+
+                    let line: usize = match line_str.parse() {
+                        Ok(n) => n,
+                        Err(_) => {
+                            self.write_buf.extend_from_slice(&create_error(
+                                msg_id,
+                                "Invalid line number in INS",
+                            ));
+                            metrics.errors += 1;
+                            continue;
+                        }
+                    };
+
+                    let col: usize = match col_str.parse() {
+                        Ok(n) => n,
+                        Err(_) => {
+                            self.write_buf.extend_from_slice(&create_error(
+                                msg_id,
+                                "Invalid column number in INS",
+                            ));
+                            metrics.errors += 1;
+                            continue;
+                        }
+                    };
+
+                    match document.insert(line, col, text_to_insert) {
+                        Ok(()) => {
+                            // Echo back exact same message with request ID
+                            self.write_buf.extend_from_slice(&msg_bytes);
+
+                            // Broadcast updated document state to all registered clients
+                            let doc_payload = format!("{}\n{}", document.revision, document.text());
+                            broadcast_to_all(
+                                clients,
+                                self.id,
+                                &mut self.write_buf,
+                                b"GET ",
+                                doc_payload.as_bytes(),
+                            );
+                        }
+                        Err(err_msg) => {
+                            self.write_buf
+                                .extend_from_slice(&create_error(msg_id, err_msg));
+                            warn!("INS failed: {}", err_msg);
+                            metrics.errors += 1;
+                        }
+                    }
+                }
+                b"DEL " => {
+                    let is_registered = clients.get(&self.id).is_some_and(|c| c.username.is_some());
+                    if !is_registered {
+                        self.write_buf.extend_from_slice(&create_error(
+                            msg_id,
+                            "Not registered. Send USR first.",
+                        ));
+                        warn!("Tried to DEL without username");
+                        metrics.errors += 1;
+                        continue;
+                    }
+
+                    let payload_str = match std::str::from_utf8(payload) {
+                        Ok(s) => s,
+                        Err(err) => {
+                            warn!("Failed parsing of DEL payload: {}", err);
+                            metrics.errors += 1;
+                            self.write_buf.extend_from_slice(&create_error(
+                                msg_id,
+                                "Invalid UTF-8 in DEL payload",
+                            ));
+                            continue;
+                        }
+                    };
+
+                    let mut parts = payload_str.split_whitespace();
+                    let (line_str, col_str, count_str) =
+                        match (parts.next(), parts.next(), parts.next(), parts.next()) {
+                            (Some(l), Some(c), Some(cnt), None) => (l, c, cnt),
+                            _ => {
+                                self.write_buf.extend_from_slice(&create_error(
+                                    msg_id,
+                                    "Invalid DEL syntax. Expected: <line> <col> <count>",
+                                ));
+                                warn!("DEL invalid syntax");
+                                metrics.errors += 1;
+                                continue;
+                            }
+                        };
+
+                    let line: usize = match line_str.parse() {
+                        Ok(n) => n,
+                        Err(_) => {
+                            self.write_buf.extend_from_slice(&create_error(
+                                msg_id,
+                                "Invalid line number in DEL",
+                            ));
+                            metrics.errors += 1;
+                            continue;
+                        }
+                    };
+
+                    let col: usize = match col_str.parse() {
+                        Ok(n) => n,
+                        Err(_) => {
+                            self.write_buf.extend_from_slice(&create_error(
+                                msg_id,
+                                "Invalid column number in DEL",
+                            ));
+                            metrics.errors += 1;
+                            continue;
+                        }
+                    };
+
+                    let count: usize = match count_str.parse() {
+                        Ok(n) => n,
+                        Err(_) => {
+                            self.write_buf
+                                .extend_from_slice(&create_error(msg_id, "Invalid count in DEL"));
+                            metrics.errors += 1;
+                            continue;
+                        }
+                    };
+
+                    match document.delete(line, col, count) {
+                        Ok(()) => {
+                            // Echo back exact same message with request ID
+                            self.write_buf.extend_from_slice(&msg_bytes);
+
+                            // Broadcast updated document state to all registered clients
+                            let doc_payload = format!("{}\n{}", document.revision, document.text());
+                            broadcast_to_all(
+                                clients,
+                                self.id,
+                                &mut self.write_buf,
+                                b"GET ",
+                                doc_payload.as_bytes(),
+                            );
+                        }
+                        Err(err_msg) => {
+                            self.write_buf
+                                .extend_from_slice(&create_error(msg_id, err_msg));
+                            warn!("DEL failed: {}", err_msg);
+                            metrics.errors += 1;
+                        }
                     }
                 }
 
@@ -253,6 +451,31 @@ impl Client {
                 }
             }
         }
+    }
+}
+
+/// Broadcasts a server-originated message to the sender and all other registered clients.
+fn broadcast_to_all(
+    clients: &mut HashMap<ClientId, ClientHandle>,
+    self_id: ClientId,
+    self_write_buf: &mut Vec<u8>,
+    msg_type: &[u8; 4],
+    payload: &[u8],
+) {
+    // 1. Send the broadcast to the sender using a SERVER allocated ID
+    if let Some(me) = clients.get_mut(&self_id) {
+        let sender_msg_id = me.take_server_msg_id();
+        self_write_buf.extend_from_slice(&frame(sender_msg_id, msg_type, payload));
+    }
+
+    // 2. Broadcast to all OTHER registered users; each one's task does the write
+    for (other_id, other) in clients.iter_mut() {
+        if *other_id == self_id || other.username.is_none() {
+            continue;
+        }
+        let other_msg_id = other.take_server_msg_id();
+        let other_msg = frame(other_msg_id, msg_type, payload);
+        let _ = other.tx.send(other_msg);
     }
 }
 
@@ -364,5 +587,118 @@ mod tests {
         b.process_messages(&mut state);
 
         assert_eq!(b.write_buf, create_error(1, "Username already taken!"));
+    }
+
+    #[test]
+    fn get_ins_del_flow_and_broadcast() {
+        let mut state = State::default();
+        let (tx_a, _rx_a) = mpsc::unbounded_channel();
+        let (tx_b, mut rx_b) = mpsc::unbounded_channel();
+        state.clients.insert(1, ClientHandle::new(tx_a));
+        state.clients.insert(2, ClientHandle::new(tx_b));
+
+        let mut a = Client::new(1, addr());
+        let mut b = Client::new(2, addr());
+
+        // Register both users
+        a.read_buf.extend_from_slice(&frame(1, b"USR ", b"alice"));
+        a.process_messages(&mut state);
+        a.write_buf.clear();
+
+        b.read_buf.extend_from_slice(&frame(1, b"USR ", b"bob"));
+        b.process_messages(&mut state);
+        b.write_buf.clear();
+
+        // Initial GET returns revision 0 and empty document
+        a.read_buf.extend_from_slice(&frame(3, b"GET ", b""));
+        a.process_messages(&mut state);
+        assert_eq!(a.write_buf, frame(3, b"GET ", b"0\n"));
+        a.write_buf.clear();
+
+        // Alice inserts text at (0, 0)
+        a.read_buf
+            .extend_from_slice(&frame(5, b"INS ", b"0 0 Hello World"));
+        a.process_messages(&mut state);
+
+        // Alice receives: 1) Echo of INS with req id 5, 2) Broadcast of GET with server id 2
+        let mut expected_a = Vec::new();
+        expected_a.extend_from_slice(&frame(5, b"INS ", b"0 0 Hello World"));
+        expected_a.extend_from_slice(&frame(2, b"GET ", b"1\nHello World"));
+        assert_eq!(a.write_buf, expected_a);
+        a.write_buf.clear();
+
+        // Bob receives the broadcast of GET with server id 2
+        assert_eq!(
+            rx_b.try_recv().unwrap(),
+            frame(2, b"GET ", b"1\nHello World")
+        );
+
+        // Alice deletes "World" (5 chars at col 6)
+        a.read_buf.extend_from_slice(&frame(7, b"DEL ", b"0 6 5"));
+        a.process_messages(&mut state);
+
+        let mut expected_a_del = Vec::new();
+        expected_a_del.extend_from_slice(&frame(7, b"DEL ", b"0 6 5"));
+        expected_a_del.extend_from_slice(&frame(4, b"GET ", b"2\nHello "));
+        assert_eq!(a.write_buf, expected_a_del);
+        a.write_buf.clear();
+
+        // Bob receives delete broadcast with server id 4
+        assert_eq!(rx_b.try_recv().unwrap(), frame(4, b"GET ", b"2\nHello "));
+    }
+
+    #[test]
+    fn ins_and_del_error_handling() {
+        let mut state = State::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        state.clients.insert(1, ClientHandle::new(tx));
+        let mut a = Client::new(1, addr());
+
+        // Unregistered request fails
+        a.read_buf.extend_from_slice(&frame(1, b"GET ", b""));
+        a.process_messages(&mut state);
+        assert_eq!(
+            a.write_buf,
+            create_error(1, "Not registered. Send USR first.")
+        );
+        a.write_buf.clear();
+
+        // Register
+        a.read_buf.extend_from_slice(&frame(1, b"USR ", b"alice"));
+        a.process_messages(&mut state);
+        a.write_buf.clear();
+
+        // Invalid INS syntax
+        a.read_buf.extend_from_slice(&frame(3, b"INS ", b"bad"));
+        a.process_messages(&mut state);
+        assert_eq!(
+            a.write_buf,
+            create_error(3, "Invalid INS syntax. Expected: <line> <col> <text>")
+        );
+        a.write_buf.clear();
+
+        // Exceeding MAX_COLUMNS
+        a.read_buf
+            .extend_from_slice(&frame(5, b"INS ", b"0 85 abc"));
+        a.process_messages(&mut state);
+        assert_eq!(
+            a.write_buf,
+            create_error(5, "Column exceeds maximum line width")
+        );
+        a.write_buf.clear();
+
+        // Invalid DEL syntax
+        a.read_buf.extend_from_slice(&frame(7, b"DEL ", b"0 0"));
+        a.process_messages(&mut state);
+        assert_eq!(
+            a.write_buf,
+            create_error(7, "Invalid DEL syntax. Expected: <line> <col> <count>")
+        );
+        a.write_buf.clear();
+
+        // DEL out of bounds
+        a.read_buf.extend_from_slice(&frame(9, b"DEL ", b"5 0 1"));
+        a.process_messages(&mut state);
+        assert_eq!(a.write_buf, create_error(9, "Line out of bounds"));
     }
 }

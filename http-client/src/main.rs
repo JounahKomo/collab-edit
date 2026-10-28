@@ -40,7 +40,7 @@ struct Args {
     ports: String,
 
     /// Protocol version
-    #[arg(long, default_value = "base-3", env = "PROTOCOL")]
+    #[arg(long, default_value = "komon-1", env = "PROTOCOL")]
     protocol: String,
 
     /// Optional environment variables in KEY=VALUE format
