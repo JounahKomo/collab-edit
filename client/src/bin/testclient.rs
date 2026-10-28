@@ -18,7 +18,7 @@ const MIN_CONNECTIONS: usize = 5;
 const BROADCAST_TEXT: &str = "Hello everyone!";
 
 /// Every message ID a connection uses in its own requests.
-const CLIENT_IDS: [u32; 8] = [1, 3, 5, 7, 9, 11, 13, 15];
+const CLIENT_IDS: [u32; 12] = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23];
 
 #[derive(Parser, Debug, Clone)]
 struct Args {
@@ -37,6 +37,10 @@ struct Args {
     /// Number of concurrent connections (at least 5)
     #[arg(short, long, default_value_t = MIN_CONNECTIONS)]
     connections: usize,
+
+    /// Protocol version to test (defaults to 'base-3'; use 'komon-1' to test document features)
+    #[arg(long, default_value = "base-3", env = "PROTOCOL")]
+    protocol: String,
 
     /// Path to custom Root CA certificate (.crt / .pem) for verifying the server
     #[arg(long, env = "TLS_CA_CERT")]
@@ -70,6 +74,15 @@ fn ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
+struct ConnectionConfig {
+    address: String,
+    user_prefix: String,
+    barrier: Arc<Barrier>,
+    tls_config: Option<Arc<ClientConfig>>,
+    sni_name: String,
+    is_komon: bool,
+}
+
 fn main() -> ExitCode {
     let args = Args::parse();
     let connections = args.connections.max(MIN_CONNECTIONS);
@@ -78,8 +91,11 @@ fn main() -> ExitCode {
     }
 
     let address = format!("{}:{}", args.addr, args.port);
+    let is_komon = args.protocol == "komon-1";
+
     println!(
-        "Opening {connections} concurrent connections to {address} (TLS: {})...",
+        "Opening {connections} concurrent connections to {address} (Protocol: {}, TLS: {})...",
+        args.protocol,
         if args.no_tls { "disabled" } else { "enabled" }
     );
 
@@ -103,28 +119,20 @@ fn main() -> ExitCode {
         }
     });
 
-    let barrier = Arc::new(Barrier::new(connections));
+    let config = Arc::new(ConnectionConfig {
+        address,
+        user_prefix: args.user,
+        barrier: Arc::new(Barrier::new(connections)),
+        tls_config,
+        sni_name,
+        is_komon,
+    });
     let total_start = Instant::now();
 
     let handles: Vec<_> = (0..connections)
         .map(|index| {
-            let address = address.clone();
-            let user_prefix = args.user.clone();
-            let barrier = Arc::clone(&barrier);
-            let tls_config = tls_config.clone();
-            let sni_name = sni_name.clone();
-
-            thread::spawn(move || {
-                run_connection(
-                    index,
-                    connections,
-                    &address,
-                    &user_prefix,
-                    &barrier,
-                    tls_config,
-                    &sni_name,
-                )
-            })
+            let config = Arc::clone(&config);
+            thread::spawn(move || run_connection(index, connections, &config))
         })
         .collect();
 
@@ -245,7 +253,6 @@ fn connect(
             .map_err(|e| io::Error::other(e.to_string()))?;
 
         let mut tls_stream = StreamOwned::new(conn, tcp_stream);
-        // Force initial TLS handshake
         tls_stream.flush()?;
         Ok(ConnectionStream::Tls(Box::new(tls_stream)))
     } else {
@@ -253,18 +260,10 @@ fn connect(
     }
 }
 
-fn run_connection(
-    index: usize,
-    total: usize,
-    address: &str,
-    user_prefix: &str,
-    barrier: &Barrier,
-    tls_config: Option<Arc<ClientConfig>>,
-    sni_name: &str,
-) -> Report {
+fn run_connection(index: usize, total: usize, config: &ConnectionConfig) -> Report {
     let start = Instant::now();
-    let username = format!("{user_prefix}{index}");
-    let first_username = format!("{user_prefix}0");
+    let username = format!("{}{}", config.user_prefix, index);
+    let first_username = format!("{}0", config.user_prefix);
     let mut report = Report {
         index,
         username: username.clone(),
@@ -275,7 +274,7 @@ fn run_connection(
     };
 
     let connect_start = Instant::now();
-    let mut stream = match connect(address, tls_config, sni_name) {
+    let mut stream = match connect(&config.address, config.tls_config.clone(), &config.sni_name) {
         Ok(s) => Some(s),
         Err(e) => {
             report.check(&format!("connect to server ({e})"), false);
@@ -300,7 +299,7 @@ fn run_connection(
 
         if sync {
             let wait_start = Instant::now();
-            barrier.wait();
+            config.barrier.wait();
             report.waiting += wait_start.elapsed();
         }
     };
@@ -390,7 +389,10 @@ fn run_connection(
     );
 
     // Phase 4: broadcast
-    let expected_payload = format!("{user_prefix}{broadcaster} general {BROADCAST_TEXT}");
+    let expected_payload = format!(
+        "{}{} general {}",
+        config.user_prefix, broadcaster, BROADCAST_TEXT
+    );
     phase(
         &mut stream,
         &mut report,
@@ -443,8 +445,136 @@ fn run_connection(
             }
             Ok(())
         },
-        false,
+        true,
     );
+
+    // Document Protocol Testing (komon-1 only)
+    if config.is_komon {
+        // Phase 6: GET document
+        phase(
+            &mut stream,
+            &mut report,
+            "document GET",
+            &|s, r| {
+                if index == 0 {
+                    s.write_all(&create_message(17, "GET ", ""))?;
+                    s.flush()?;
+                    let (_, id, ty, payload) = decode_message(&read_frame(s)?);
+                    let valid_get = ty == "GET " && id == 17 && payload.contains('\n');
+                    r.check(
+                        "GET returns document status (<revision>\\n<content>)",
+                        valid_get,
+                    );
+                }
+                Ok(())
+            },
+            true,
+        );
+
+        // Phase 7: INS document and broadcast
+        phase(
+            &mut stream,
+            &mut report,
+            "document INS & broadcast",
+            &|s, r| {
+                if index == 0 {
+                    s.write_all(&create_message(19, "INS ", "0 0 Collaborative"))?;
+                    s.flush()?;
+                    // 1) Echo of INS with request ID 19
+                    let ins_frame = read_frame(s)?;
+                    let (_, ins_id, ins_ty, _) = decode_message(&ins_frame);
+                    r.check(
+                        "INS echoed with request ID",
+                        ins_ty == "INS " && ins_id == 19,
+                    );
+
+                    // 2) Broadcast GET with server-allocated ID
+                    let get_frame = read_frame(s)?;
+                    let (_, get_id, get_ty, payload) = decode_message(&get_frame);
+                    r.check(
+                        "INS triggers GET broadcast to sender with server ID",
+                        get_ty == "GET "
+                            && !CLIENT_IDS.contains(&get_id)
+                            && payload.contains("Collaborative"),
+                    );
+                } else {
+                    // Other clients receive GET broadcast with their server ID
+                    let get_frame = read_frame(s)?;
+                    let (_, get_id, get_ty, payload) = decode_message(&get_frame);
+                    r.check(
+                        "peers receive GET broadcast after INS",
+                        get_ty == "GET "
+                            && !CLIENT_IDS.contains(&get_id)
+                            && payload.contains("Collaborative"),
+                    );
+                }
+                Ok(())
+            },
+            true,
+        );
+
+        // Phase 8: DEL document and broadcast
+        phase(
+            &mut stream,
+            &mut report,
+            "document DEL & broadcast",
+            &|s, r| {
+                if index == 0 {
+                    s.write_all(&create_message(21, "DEL ", "0 0 5"))?;
+                    s.flush()?;
+                    // 1) Echo of DEL with request ID 21
+                    let del_frame = read_frame(s)?;
+                    let (_, del_id, del_ty, _) = decode_message(&del_frame);
+                    r.check(
+                        "DEL echoed with request ID",
+                        del_ty == "DEL " && del_id == 21,
+                    );
+
+                    // 2) Broadcast GET with server-allocated ID
+                    let get_frame = read_frame(s)?;
+                    let (_, get_id, get_ty, payload) = decode_message(&get_frame);
+                    r.check(
+                        "DEL triggers GET broadcast to sender with server ID",
+                        get_ty == "GET "
+                            && !CLIENT_IDS.contains(&get_id)
+                            && payload.contains("borative"),
+                    );
+                } else {
+                    // Other clients receive GET broadcast with their server ID
+                    let get_frame = read_frame(s)?;
+                    let (_, get_id, get_ty, payload) = decode_message(&get_frame);
+                    r.check(
+                        "peers receive GET broadcast after DEL",
+                        get_ty == "GET "
+                            && !CLIENT_IDS.contains(&get_id)
+                            && payload.contains("borative"),
+                    );
+                }
+                Ok(())
+            },
+            true,
+        );
+
+        // Phase 9: Document error cases (exceeding MAX_COLUMNS)
+        phase(
+            &mut stream,
+            &mut report,
+            "document bounds error",
+            &|s, r| {
+                if index == 1 {
+                    s.write_all(&create_message(23, "INS ", "0 85 out_of_bounds"))?;
+                    s.flush()?;
+                    let (_, id, ty, _) = decode_message(&read_frame(s)?);
+                    r.check(
+                        "INS beyond max columns returns ERR with same ID",
+                        ty == "ERR " && id == 23,
+                    );
+                }
+                Ok(())
+            },
+            true,
+        );
+    }
 
     report.elapsed = start.elapsed();
     report
