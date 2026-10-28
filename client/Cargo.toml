@@ -2,11 +2,16 @@
 name = "client"
 version = "0.1.0"
 edition = "2024"
+default-run = "client"
 
 [dependencies]
+slint = "1.18.1"
 tracing = { workspace = true }
 clap = { version = "4.6", features = ["derive", "env"] }
 rustls = "0.23"
 rustls-pki-types = "1"
 rustls-pemfile = "2"
 webpki-roots = "1"
+
+[build-dependencies]
+slint-build = "1.18.1"

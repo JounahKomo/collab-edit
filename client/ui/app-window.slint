@@ -1,0 +1,179 @@
+import { ScrollView } from "std-widgets.slint";
+
+export component AppWindow inherits Window {
+    title: "CollabEdit - Collaborative Document Editor";
+    preferred-width: 900px;
+    preferred-height: 800px;
+    background: #e5e7eb;
+
+    in-out property <[string]> doc-lines: [""];
+    in-out property <int> cursor-line: 0;
+    in-out property <int> cursor-col: 0;
+    in-out property <string> line-prefix: "";
+    in-out property <string> line-suffix: "";
+    in-out property <int> revision: 0;
+    in-out property <string> username: "User";
+    in-out property <string> status-text: "Connected";
+
+    // Callbacks to Rust
+    callback key-typed(string);
+    callback backspace-pressed();
+    callback enter-pressed();
+    callback arrow-pressed(string); // "up", "down", "left", "right"
+
+    forward-focus: focus-scope;
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 12px;
+
+        // Top info bar
+        HorizontalLayout {
+            spacing: 24px;
+            Text {
+                text: "User: " + root.username;
+                font-size: 14px;
+                font-weight: 600;
+                color: #1f2937;
+                vertical-alignment: center;
+            }
+            Text {
+                text: "Status: " + root.status-text;
+                font-size: 14px;
+                color: #059669;
+                vertical-alignment: center;
+            }
+            Text {
+                text: "Rev: " + root.revision;
+                font-size: 14px;
+                color: #4b5563;
+                vertical-alignment: center;
+            }
+            Rectangle { } // spacer
+            Text {
+                text: "Ln " + (root.cursor-line + 1) + ", Col " + (root.cursor-col + 1);
+                font-size: 14px;
+                font-family: "monospace";
+                color: #374151;
+                vertical-alignment: center;
+            }
+        }
+
+        // Workspace background with centered white page
+        ScrollView {
+            HorizontalLayout {
+                alignment: center;
+                padding-bottom: 24px;
+
+                page := Rectangle {
+                    width: 760px;
+                    min-height: 900px;
+                    background: #ffffff;
+                    border-radius: 4px;
+                    border-width: 1px;
+                    border-color: #d1d5db;
+                    drop-shadow-blur: 10px;
+                    drop-shadow-offset-y: 3px;
+                    drop-shadow-color: #0000001a;
+
+                    focus-scope := FocusScope {
+                        x: 0;
+                        y: 0;
+                        width: parent.width;
+                        height: parent.height;
+
+                        key-pressed(event) => {
+                            if (event.text == Key.Backspace) {
+                                root.backspace-pressed();
+                                return accept;
+                            }
+                            if (event.text == Key.Return) {
+                                root.enter-pressed();
+                                return accept;
+                            }
+                            if (event.text == Key.UpArrow) {
+                                root.arrow-pressed("up");
+                                return accept;
+                            }
+                            if (event.text == Key.DownArrow) {
+                                root.arrow-pressed("down");
+                                return accept;
+                            }
+                            if (event.text == Key.LeftArrow) {
+                                root.arrow-pressed("left");
+                                return accept;
+                            }
+                            if (event.text == Key.RightArrow) {
+                                root.arrow-pressed("right");
+                                return accept;
+                            }
+                            if (event.text != "") {
+                                root.key-typed(event.text);
+                                return accept;
+                            }
+                            reject
+                        }
+
+                        TouchArea {
+                            clicked => {
+                                focus-scope.focus();
+                            }
+                        }
+
+                        VerticalLayout {
+                            padding-top: 36px;
+                            padding-bottom: 36px;
+                            padding-left: 44px;
+                            padding-right: 44px;
+                            spacing: 2px;
+
+                            for line[idx] in root.doc-lines: HorizontalLayout {
+                                height: 22px;
+                                alignment: start;
+                                spacing: 0;
+
+                                // Active cursor line
+                                if idx == root.cursor-line: HorizontalLayout {
+                                    spacing: 0;
+                                    alignment: start;
+
+                                    Text {
+                                        text: root.line-prefix;
+                                        font-family: "monospace";
+                                        font-size: 15px;
+                                        color: #111827;
+                                        vertical-alignment: center;
+                                    }
+
+                                    // The cursor bar
+                                    Rectangle {
+                                        width: 2px;
+                                        height: 19px;
+                                        background: #2563eb;
+                                    }
+
+                                    Text {
+                                        text: root.line-suffix;
+                                        font-family: "monospace";
+                                        font-size: 15px;
+                                        color: #111827;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                // Inactive lines
+                                if idx != root.cursor-line: Text {
+                                    text: line == "" ? " " : line;
+                                    font-family: "monospace";
+                                    font-size: 15px;
+                                    color: #111827;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
