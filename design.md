@@ -8,11 +8,11 @@ The editor organizes text as a free-form document grid constrained to a standard
 
 ## Clients
 
-The primary client is a graphical desktop application developed in Rust using the **Slint** GUI toolkit (`slint` crate). The Slint UI provides an initial username login dialog, an intuitive white document canvas, monospace text rendering, a visual cursor indicator for the current user position, and a status bar displaying session status and cursor coordinates. Under the hood, the client architecture is modularly separated:
-- **UI Layer (`ui/app-window.slint`):** Handles visual styling, login prompt dialog, white document page layout, and captures keyboard events (keystrokes, Enter line splits, Backspace deletions, and arrow key navigation).
+The primary client is a graphical desktop application developed in Rust using the **Slint** GUI toolkit (`slint` crate). The Slint UI provides an initial username login dialog, a multi-page document layout (automatically creating new standard-sized pages as line count grows, similar to Microsoft Word or Google Docs), monospace text rendering, a visual cursor indicator for the current user position, and a status bar displaying session status, active page count (`Page X of Y`), and cursor coordinates. Under the hood, the client architecture is modularly separated:
+- **UI Layer (`ui/app-window.slint`):** Handles visual styling, login prompt dialog, multi-page document layout with page sheets and dropshadows, and captures keyboard events (keystrokes, Enter line splits, Backspace deletions, and arrow key navigation).
 - **Document State (`doc_state.rs`):** Tracks local document lines, cursor coordinates, and revision numbers, handling optimistic local line-splitting, line-merging, and server revision state reconciliation.
 - **Networking Layer (`net.rs`):** Abstracts TLS (`rustls`) and plain TCP stream handling, connection establishment, certificate validation, and binary frame encoding/decoding.
-- **Application Controller (`main.rs`):** Runs the background I/O worker thread and bridges network events to the Slint UI thread via `slint::invoke_from_event_loop`.
+- **Application Controller (`main.rs`):** Chunks linear document lines into page data (`LINES_PER_PAGE = 35`), runs the background I/O worker thread, and bridges network events to the Slint UI thread via `slint::invoke_from_event_loop`.
 
 While the graphical client is focused on direct user interaction, the architecture also supports headless clients, such as our multi-threaded test client (`testclient`) for automated regression testing and benchmarking, and potential future headless bot clients (e.g., automated document spell-checkers or document export tools).
 

@@ -1,12 +1,22 @@
 import { ScrollView, LineEdit, Button } from "std-widgets.slint";
 
+export struct PageLineData {
+    global_idx: int,
+    text: string,
+}
+
+export struct PageData {
+    page_number: int,
+    lines: [PageLineData],
+}
+
 export component AppWindow inherits Window {
     title: "CollabEdit - Collaborative Document Editor";
     preferred-width: 900px;
-    preferred-height: 800px;
+    preferred-height: 850px;
     background: #e5e7eb;
 
-    in-out property <[string]> doc-lines: [""];
+    in-out property <[PageData]> pages: [];
     in-out property <int> cursor-line: 0;
     in-out property <int> cursor-col: 0;
     in-out property <string> line-prefix: "";
@@ -157,6 +167,12 @@ export component AppWindow inherits Window {
                 }
                 Rectangle { } // spacer
                 Text {
+                    text: "Page " + (Math.floor(root.cursor-line / 35) + 1) + " of " + Math.max(1, root.pages.length);
+                    font-size: 14px;
+                    color: #4b5563;
+                    vertical-alignment: center;
+                }
+                Text {
                     text: "Ln " + (root.cursor-line + 1) + ", Col " + (root.cursor-col + 1);
                     font-size: 14px;
                     font-family: "monospace";
@@ -165,77 +181,84 @@ export component AppWindow inherits Window {
                 }
             }
 
-            // Workspace background with centered white page
+            // Workspace background with multi-page layout
             ScrollView {
-                HorizontalLayout {
-                    alignment: center;
-                    padding-bottom: 24px;
+                VerticalLayout {
+                    spacing: 24px;
+                    padding-top: 12px;
+                    padding-bottom: 36px;
+                    alignment: start;
 
-                    page := Rectangle {
-                        width: 760px;
-                        min-height: 900px;
-                        background: #ffffff;
-                        border-radius: 4px;
-                        border-width: 1px;
-                        border-color: #d1d5db;
-                        drop-shadow-blur: 10px;
-                        drop-shadow-offset-y: 3px;
-                        drop-shadow-color: #0000001a;
+                    for page_data in root.pages: HorizontalLayout {
+                        alignment: center;
 
-                        TouchArea {
-                            clicked => {
-                                main-scope.focus();
-                            }
-                        }
+                        Rectangle {
+                            width: 760px;
+                            height: 900px;
+                            background: #ffffff;
+                            border-radius: 2px;
+                            border-width: 1px;
+                            border-color: #d1d5db;
+                            drop-shadow-blur: 10px;
+                            drop-shadow-offset-y: 3px;
+                            drop-shadow-color: #0000001a;
 
-                        VerticalLayout {
-                            padding-top: 36px;
-                            padding-bottom: 36px;
-                            padding-left: 44px;
-                            padding-right: 44px;
-                            spacing: 2px;
-
-                            for line[idx] in root.doc-lines: HorizontalLayout {
-                                height: 22px;
-                                alignment: start;
-                                spacing: 0;
-
-                                // Active cursor line
-                                if idx == root.cursor-line: HorizontalLayout {
-                                    spacing: 0;
-                                    alignment: start;
-
-                                    Text {
-                                        text: root.line-prefix;
-                                        font-family: "monospace";
-                                        font-size: 15px;
-                                        color: #111827;
-                                        vertical-alignment: center;
-                                    }
-
-                                    // The cursor bar
-                                    Rectangle {
-                                        width: 2px;
-                                        height: 19px;
-                                        background: #2563eb;
-                                    }
-
-                                    Text {
-                                        text: root.line-suffix;
-                                        font-family: "monospace";
-                                        font-size: 15px;
-                                        color: #111827;
-                                        vertical-alignment: center;
-                                    }
+                            TouchArea {
+                                clicked => {
+                                    main-scope.focus();
                                 }
+                            }
 
-                                // Inactive lines
-                                if idx != root.cursor-line: Text {
-                                    text: line == "" ? " " : line;
-                                    font-family: "monospace";
-                                    font-size: 15px;
-                                    color: #111827;
-                                    vertical-alignment: center;
+                            VerticalLayout {
+                                padding-top: 40px;
+                                padding-bottom: 40px;
+                                padding-left: 48px;
+                                padding-right: 48px;
+                                spacing: 1px;
+                                alignment: start;
+
+                                for line in page_data.lines: HorizontalLayout {
+                                    height: 23px;
+                                    alignment: start;
+                                    spacing: 0;
+
+                                    // Active cursor line
+                                    if line.global_idx == root.cursor-line: HorizontalLayout {
+                                        spacing: 0;
+                                        alignment: start;
+
+                                        Text {
+                                            text: root.line-prefix;
+                                            font-family: "monospace";
+                                            font-size: 15px;
+                                            color: #111827;
+                                            vertical-alignment: center;
+                                        }
+
+                                        // The cursor bar
+                                        Rectangle {
+                                            width: 2px;
+                                            height: 19px;
+                                            background: #2563eb;
+                                        }
+
+                                        Text {
+                                            text: root.line-suffix;
+                                            font-family: "monospace";
+                                            font-size: 15px;
+                                            color: #111827;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+
+                                    // Inactive lines
+                                    if line.global_idx != root.cursor-line: Text {
+                                        text: line.text == "" ? " " : line.text;
+                                        font-family: "monospace";
+                                        font-size: 15px;
+                                        color: #111827;
+                                        vertical-alignment: center;
+                                    }
                                 }
                             }
                         }

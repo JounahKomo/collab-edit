@@ -18,6 +18,8 @@ use net::{ConnectionStream, connect_stream, make_frame};
 
 slint::include_modules!();
 
+const LINES_PER_PAGE: usize = 35;
+
 #[derive(Parser, Debug)]
 #[command(
     author,
@@ -54,12 +56,30 @@ fn sync_ui(ui: &AppWindow, state: &ClientDocState) {
     ui.set_line_prefix(prefix.into());
     ui.set_line_suffix(suffix.into());
 
-    let lines_model: Vec<slint::SharedString> = state
-        .lines
-        .iter()
-        .map(|s| slint::SharedString::from(s.as_str()))
-        .collect();
-    ui.set_doc_lines(slint::ModelRc::new(slint::VecModel::from(lines_model)));
+    // Group lines into pages of LINES_PER_PAGE lines
+    let total_lines = state.lines.len();
+    let num_pages = (total_lines.div_ceil(LINES_PER_PAGE)).max(1);
+
+    let mut pages_vec: Vec<PageData> = Vec::with_capacity(num_pages);
+    for page_idx in 0..num_pages {
+        let start_line = page_idx * LINES_PER_PAGE;
+        let end_line = (start_line + LINES_PER_PAGE).min(total_lines);
+
+        let mut page_lines: Vec<PageLineData> = Vec::with_capacity(LINES_PER_PAGE);
+        for global_idx in start_line..end_line {
+            page_lines.push(PageLineData {
+                global_idx: global_idx as i32,
+                text: state.lines[global_idx].as_str().into(),
+            });
+        }
+
+        pages_vec.push(PageData {
+            page_number: (page_idx + 1) as i32,
+            lines: slint::ModelRc::new(slint::VecModel::from(page_lines)),
+        });
+    }
+
+    ui.set_pages(slint::ModelRc::new(slint::VecModel::from(pages_vec)));
 }
 
 fn next_msg_id(counter: &AtomicU32) -> u32 {
