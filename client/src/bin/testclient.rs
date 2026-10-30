@@ -38,7 +38,7 @@ struct Args {
     #[arg(short, long, default_value_t = MIN_CONNECTIONS)]
     connections: usize,
 
-    /// Protocol version to test (defaults to 'base-3'; use 'komon-1' to test document features)
+    /// Protocol version to test (defaults to 'base-3'; use 'komon-2' to test document and multi-channel features)
     #[arg(long, default_value = "base-3", env = "PROTOCOL")]
     protocol: String,
 
@@ -80,7 +80,7 @@ struct ConnectionConfig {
     barrier: Arc<Barrier>,
     tls_config: Option<Arc<ClientConfig>>,
     sni_name: String,
-    is_komon: bool,
+    is_komon2: bool,
 }
 
 fn main() -> ExitCode {
@@ -91,7 +91,7 @@ fn main() -> ExitCode {
     }
 
     let address = format!("{}:{}", args.addr, args.port);
-    let is_komon = args.protocol == "komon-1";
+    let is_komon2 = args.protocol == "komon-2";
 
     println!(
         "Opening {connections} concurrent connections to {address} (Protocol: {}, TLS: {})...",
@@ -125,7 +125,7 @@ fn main() -> ExitCode {
         barrier: Arc::new(Barrier::new(connections)),
         tls_config,
         sni_name,
-        is_komon,
+        is_komon2,
     });
     let total_start = Instant::now();
 
@@ -367,13 +367,24 @@ fn run_connection(index: usize, total: usize, config: &ConnectionConfig) -> Repo
                 r.check("duplicate username gets ERR", ty == "ERR " && id == 9);
             }
             if index == 3 {
-                s.write_all(&create_message(9, "MSG ", "nochannel Hi"))?;
-                s.flush()?;
-                let (_, id, ty, _) = decode_message(&read_frame(s)?);
-                r.check(
-                    "MSG to unknown channel gets ERR with the same id",
-                    ty == "ERR " && id == 9,
-                );
+                if config.is_komon2 {
+                    // In komon-2, unrecognized channels are dynamically created and echoed
+                    s.write_all(&create_message(9, "MSG ", "nochannel Hi"))?;
+                    s.flush()?;
+                    let (_, id, ty, payload) = decode_message(&read_frame(s)?);
+                    r.check(
+                        "MSG to new channel dynamically creates channel and broadcasts",
+                        ty == "MSG " && !CLIENT_IDS.contains(&id) && payload.contains("nochannel Hi"),
+                    );
+                } else {
+                    s.write_all(&create_message(9, "MSG ", "nochannel Hi"))?;
+                    s.flush()?;
+                    let (_, id, ty, _) = decode_message(&read_frame(s)?);
+                    r.check(
+                        "MSG to unknown channel gets ERR with the same id",
+                        ty == "ERR " && id == 9,
+                    );
+                }
 
                 s.write_all(&create_message(11, "MSG ", "malformed"))?;
                 s.flush()?;
@@ -448,8 +459,8 @@ fn run_connection(index: usize, total: usize, config: &ConnectionConfig) -> Repo
         true,
     );
 
-    // Document Protocol Testing (komon-1 only)
-    if config.is_komon {
+    // Document & Multi-Channel Protocol Testing (komon-2 only)
+    if config.is_komon2 {
         // Phase 6: GET document
         phase(
             &mut stream,
@@ -568,6 +579,45 @@ fn run_connection(index: usize, total: usize, config: &ConnectionConfig) -> Repo
                     r.check(
                         "INS beyond max columns returns ERR with same ID",
                         ty == "ERR " && id == 23,
+                    );
+                }
+                Ok(())
+            },
+            true,
+        );
+
+        // Phase 10: Multi-channel dynamic creation and broadcasting
+        phase(
+            &mut stream,
+            &mut report,
+            "multi-channel broadcast",
+            &|s, r| {
+                let channel_name = "project-updates";
+                let msg_text = "Welcome to the new channel!";
+
+                if index == 0 {
+                    // Connection 0 sends a message to an unrecognized channel name
+                    s.write_all(&create_message(25, "MSG ", &format!("{channel_name} {msg_text}")))?;
+                    s.flush()?;
+                    let (len, id, ty, payload) = decode_message(&read_frame(s)?);
+                    let expected_echo = format!("{}0 {channel_name} {msg_text}", config.user_prefix);
+                    r.check(
+                        "MSG to new channel dynamically creates channel and echoes to sender",
+                        ty == "MSG "
+                            && !CLIENT_IDS.contains(&id)
+                            && payload == expected_echo
+                            && len as usize == 12 + payload.len(),
+                    );
+                } else {
+                    // Other connections receive the broadcast on the dynamically created channel
+                    let (len, id, ty, payload) = decode_message(&read_frame(s)?);
+                    let expected_broadcast = format!("{}0 {channel_name} {msg_text}", config.user_prefix);
+                    r.check(
+                        "peers receive broadcast from dynamically created channel",
+                        ty == "MSG "
+                            && !CLIENT_IDS.contains(&id)
+                            && payload == expected_broadcast
+                            && len as usize == 12 + payload.len(),
                     );
                 }
                 Ok(())

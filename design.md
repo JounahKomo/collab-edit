@@ -25,7 +25,7 @@ While the graphical client is focused on direct user interaction, the architectu
 Communication between clients and the server follows a binary-framed protocol over TCP/TLS:
 `[4 bytes length (BE)] [4 bytes message_id (BE)] [4 bytes type] [payload]`
 
-The current protocol version is komon-1 and it is backwards compatible with the base-protocol.
+The current protocol version is **`komon-2`** and it is backwards compatible with `komon-1` and the `base-protocol`. The change introduced in `komon-2` is full support for multiple channels, dynamically creating channels whenever an `MSG` is sent to an unrecognized channel name.
 
 ### Current and Planned Messages
 
@@ -48,9 +48,10 @@ The current protocol version is komon-1 and it is backwards compatible with the 
 * **`CUR ` (Interactive Cursor - Planned):**
   * *Client -> Server:* `CUR <line> <col>`
   * *Broadcast:* `CUR <username> <line> <col>` sent to other peers to display live cursor locations on their screen.
-* **`MSG ` (Chat / Messaging):**
+* **`MSG ` (Chat / Messaging with Multi-Channel Support):**
   * *Client -> Server:* `MSG <channel> <message>`
-  * *Broadcast:* `MSG <sender> <channel> <message>` broadcast to all channel participants.
+  * *Behavior:* If `<channel>` is not yet recognized by the server, the server dynamically creates a channel with that name.
+  * *Broadcast:* `MSG <sender> <channel> <message>` broadcast to all clients in the channel (echoed to sender with a newly allocated server ID).
 * **`MET ` (Metrics):**
   * *Client -> Server:* `MET `
   * *Response:* `MET <json>` containing server connection count, messages processed, and error counters.

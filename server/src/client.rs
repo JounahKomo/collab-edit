@@ -61,11 +61,24 @@ impl ClientHandle {
 }
 
 /// State shared between all connection tasks.
-#[derive(Default)]
 pub struct State {
     pub clients: HashMap<ClientId, ClientHandle>,
     pub metrics: ServerMetrics,
     pub document: Document,
+    pub channels: HashSet<String>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        let mut channels = HashSet::new();
+        channels.insert("general".to_string());
+        Self {
+            clients: HashMap::new(),
+            metrics: ServerMetrics::default(),
+            document: Document::default(),
+            channels,
+        }
+    }
 }
 
 /// Shared state handle. The lock is only ever held in synchronous code (never
@@ -106,6 +119,7 @@ impl Client {
             clients,
             metrics,
             document,
+            channels,
         } = state;
 
         loop {
@@ -208,12 +222,9 @@ impl Client {
                     };
 
                     if let Some((channel, message_text)) = payload_str.split_once(' ') {
-                        if channel != "general" {
-                            self.write_buf
-                                .extend_from_slice(&create_error(msg_id, "Unknown channel"));
-                            warn!("Tried using invalid channel: {}", channel);
-                            metrics.errors += 1;
-                            continue;
+                        // If channel does not exist, create it dynamically
+                        if channels.insert(channel.to_string()) {
+                            tracing::info!("Created new channel: {}", channel);
                         }
 
                         // Format the broadcast: <Sender> <Channel> <Message>
@@ -515,6 +526,42 @@ mod tests {
 
     fn addr() -> SocketAddr {
         "127.0.0.1:1".parse().unwrap()
+    }
+
+
+    #[test]
+    fn dynamic_channel_creation() {
+        let mut state = State::default();
+        let (tx_a, _rx_a) = mpsc::unbounded_channel();
+        let (tx_b, mut rx_b) = mpsc::unbounded_channel();
+        state.clients.insert(1, ClientHandle::new(tx_a));
+        state.clients.insert(2, ClientHandle::new(tx_b));
+
+        let mut a = Client::new(1, addr());
+        let mut b = Client::new(2, addr());
+
+        b.read_buf.extend_from_slice(&frame(1, b"USR ", b"bob"));
+        b.process_messages(&mut state);
+        a.read_buf.extend_from_slice(&frame(1, b"USR ", b"alice"));
+        a.process_messages(&mut state);
+        a.write_buf.clear();
+
+        // Send message to unrecognized channel "announcements"
+        a.read_buf
+            .extend_from_slice(&frame(3, b"MSG ", b"announcements Hello all!"));
+        a.process_messages(&mut state);
+
+        // Verify channel was created
+        assert!(state.channels.contains("announcements"));
+
+        // Sender receives echo with server-allocated id
+        assert_eq!(a.write_buf, frame(2, b"MSG ", b"alice announcements Hello all!"));
+
+        // Bob receives the broadcast message on "announcements"
+        assert_eq!(
+            rx_b.try_recv().unwrap(),
+            frame(2, b"MSG ", b"alice announcements Hello all!")
+        );
     }
 
     #[test]
