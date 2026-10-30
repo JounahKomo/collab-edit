@@ -29,9 +29,9 @@ struct Cli {
     #[arg(default_value = "127.0.0.1:5011")]
     target: String,
 
-    /// Username for collaborative session
-    #[arg(short, long, default_value = "User")]
-    username: String,
+    /// Username for collaborative session (optional; can be entered in the GUI)
+    #[arg(short, long)]
+    username: Option<String>,
 
     /// Path to custom Root CA certificate (.crt / .pem) for verifying the server
     #[arg(long, env = "TLS_CA_CERT")]
@@ -49,7 +49,6 @@ struct Cli {
 fn sync_ui(ui: &AppWindow, state: &ClientDocState) {
     ui.set_cursor_line(state.cursor_line as i32);
     ui.set_cursor_col(state.cursor_col as i32);
-    ui.set_revision(state.revision as i32);
 
     let (prefix, suffix) = state.line_prefix_suffix();
     ui.set_line_prefix(prefix.into());
@@ -181,7 +180,18 @@ fn start_network_worker(
                 let payload_bytes = &read_buf[12..length];
                 let payload = String::from_utf8_lossy(payload_bytes).to_string();
 
-                if msg_type == b"GET " {
+                if msg_type == b"USR " {
+                    let registered_user = payload.trim().to_string();
+                    let ui_clone = ui_weak.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = ui_clone.upgrade() {
+                            ui.set_username(registered_user.into());
+                            ui.set_is_logged_in(true);
+                            ui.set_login_error("".into());
+                            ui.set_status_text("Connected".into());
+                        }
+                    });
+                } else if msg_type == b"GET " {
                     let (rev, content) = if let Some((rev_str, text)) = payload.split_once('\n') {
                         (rev_str.parse::<u32>().ok(), text)
                     } else {
@@ -205,7 +215,11 @@ fn start_network_worker(
                     let ui_clone = ui_weak.clone();
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(ui) = ui_clone.upgrade() {
-                            ui.set_status_text(format!("Error: {}", err_msg).into());
+                            if !ui.get_is_logged_in() {
+                                ui.set_login_error(format!("Login failed: {}", err_msg).into());
+                            } else {
+                                ui.set_status_text(format!("Error: {}", err_msg).into());
+                            }
                         }
                     });
                 }
@@ -217,6 +231,15 @@ fn start_network_worker(
 }
 
 fn register_ui_callbacks(ui: &AppWindow, ctx: ClientContext) {
+    let ctx_login = ctx.clone();
+    ui.on_login_submitted(move |name| {
+        let clean_name = name.trim().to_string();
+        if !clean_name.is_empty() {
+            ctx_login.send_frame(b"USR ", &clean_name);
+            ctx_login.send_frame(b"GET ", "");
+        }
+    });
+
     let ctx_key = ctx.clone();
     ui.on_key_typed(move |text| {
         if text.is_empty() || text.chars().any(|c| c.is_control()) {
@@ -278,9 +301,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Connected successfully!");
 
     let ui = AppWindow::new()?;
-    ui.set_username(cli.username.clone().into());
-    ui.set_status_text("Connected".into());
-
     let doc_state = Arc::new(Mutex::new(ClientDocState::new()));
     let msg_counter = Arc::new(AtomicU32::new(1));
     let (tx_net, rx_net) = mpsc::channel::<Vec<u8>>();
@@ -298,9 +318,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         msg_counter: Arc::clone(&msg_counter),
     };
 
-    // Initial protocol handshake: send USR and GET
-    ctx.send_frame(b"USR ", &cli.username);
-    ctx.send_frame(b"GET ", "");
+    // If username was provided via CLI, send USR and GET immediately
+    if let Some(user) = cli.username {
+        if !user.trim().is_empty() {
+            ui.set_username(user.clone().into());
+            ui.set_is_logged_in(true);
+            ui.set_status_text("Connected".into());
+            ctx.send_frame(b"USR ", &user);
+            ctx.send_frame(b"GET ", "");
+        }
+    } else {
+        ui.set_status_text("Waiting for username".into());
+    }
 
     // Launch background network thread
     start_network_worker(stream, rx_net, ui.as_weak(), Arc::clone(&doc_state));
