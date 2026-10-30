@@ -51,6 +51,16 @@ impl ClientDocState {
         }
     }
 
+    /// Sets the cursor directly to a target line and column, clamping within valid boundaries.
+    pub fn set_cursor_pos(&mut self, line: usize, col: usize) {
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        self.cursor_line = line.min(self.lines.len() - 1);
+        let line_len = self.lines[self.cursor_line].chars().count();
+        self.cursor_col = col.min(line_len);
+    }
+
     /// Splits the line containing the cursor into prefix (before cursor) and suffix (after cursor).
     pub fn line_prefix_suffix(&self) -> (String, String) {
         if self.cursor_line >= self.lines.len() {
@@ -168,6 +178,25 @@ mod tests {
         assert_eq!(state.cursor_col, 0);
         assert_eq!(state.revision, 0);
         assert_eq!(state.line_prefix_suffix(), (String::new(), String::new()));
+    }
+
+    #[test]
+    fn test_set_cursor_pos() {
+        let mut state = ClientDocState::new();
+        state.lines = vec!["hello".to_string(), "world".to_string()];
+
+        state.set_cursor_pos(0, 3);
+        assert_eq!(state.cursor_line, 0);
+        assert_eq!(state.cursor_col, 3);
+
+        // Clamp past line length
+        state.set_cursor_pos(0, 20);
+        assert_eq!(state.cursor_col, 5);
+
+        // Clamp past line count
+        state.set_cursor_pos(10, 2);
+        assert_eq!(state.cursor_line, 1);
+        assert_eq!(state.cursor_col, 2);
     }
 
     #[test]

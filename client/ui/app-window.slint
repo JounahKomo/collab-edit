@@ -32,6 +32,7 @@ export component AppWindow inherits Window {
     callback enter-pressed();
     callback arrow-pressed(string); // "up", "down", "left", "right"
     callback login-submitted(string);
+    callback cursor-position-clicked(int, int); // line, col
 
     forward-focus: main-scope;
 
@@ -203,12 +204,6 @@ export component AppWindow inherits Window {
                             drop-shadow-offset-y: 3px;
                             drop-shadow-color: #0000001a;
 
-                            TouchArea {
-                                clicked => {
-                                    main-scope.focus();
-                                }
-                            }
-
                             VerticalLayout {
                                 padding-top: 40px;
                                 padding-bottom: 40px;
@@ -217,10 +212,9 @@ export component AppWindow inherits Window {
                                 spacing: 1px;
                                 alignment: start;
 
-                                for line in page_data.lines: HorizontalLayout {
+                                for line in page_data.lines: line-box := Rectangle {
                                     height: 23px;
-                                    alignment: start;
-                                    spacing: 0;
+                                    width: 100%;
 
                                     // Active cursor line
                                     if line.global_idx == root.cursor-line: HorizontalLayout {
@@ -258,6 +252,17 @@ export component AppWindow inherits Window {
                                         font-size: 15px;
                                         color: #111827;
                                         vertical-alignment: center;
+                                        width: 100%;
+                                    }
+
+                                    TouchArea {
+                                        width: 100%;
+                                        height: 100%;
+                                        clicked => {
+                                            main-scope.focus();
+                                            // 15px monospace character width is approximately 9.02px
+                                            root.cursor-position-clicked(line.global_idx, Math.floor(self.mouse-x / 9.02px));
+                                        }
                                     }
                                 }
                             }

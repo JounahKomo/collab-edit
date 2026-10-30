@@ -293,11 +293,20 @@ fn register_ui_callbacks(ui: &AppWindow, ctx: ClientContext) {
         }
     });
 
-    let ctx_arrow = ctx;
+    let ctx_arrow = ctx.clone();
     ui.on_arrow_pressed(move |dir| {
         ctx_arrow.with_state_mut(|st| {
             st.move_cursor(&dir);
         });
+    });
+
+    let ctx_click = ctx;
+    ui.on_cursor_position_clicked(move |line, col| {
+        if line >= 0 && col >= 0 {
+            ctx_click.with_state_mut(|st| {
+                st.set_cursor_pos(line as usize, col as usize);
+            });
+        }
     });
 }
 
