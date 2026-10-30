@@ -8,7 +8,13 @@ The editor organizes text as a free-form document grid constrained to a standard
 
 ## Clients
 
-The primary client will be a graphical desktop application developed in Rust using the **Slint** GUI toolkit (`slint` crate). The Slint UI will provide an intuitive text-editing canvas, render user text input, and visualize peers' cursors and selections with distinct user colors. Under the hood, the client manages network communication using TLS (`rustls`) to send edits and consume incoming document broadcasts without blocking the UI event loop. While the main client is focused on direct user interaction, the architecture also supports headless clients, such as our multi-threaded test client (`testclient`) for automated regression testing and benchmarking, and potential future headless bot clients (e.g., automated document spell-checkers or document export tools).
+The primary client is a graphical desktop application developed in Rust using the **Slint** GUI toolkit (`slint` crate). The Slint UI provides an intuitive white document canvas, monospace text rendering, and a visual cursor indicator for the current user position, alongside a status bar displaying session and revision details. Under the hood, the client architecture is modularly separated:
+- **UI Layer (`ui/app-window.slint`):** Handles visual styling, white document page layout, and captures keyboard events (keystrokes, Enter line splits, Backspace deletions, and arrow key navigation).
+- **Document State (`doc_state.rs`):** Tracks local document lines, cursor coordinates, and revision numbers, handling optimistic local line-splitting, line-merging, and server revision state reconciliation.
+- **Networking Layer (`net.rs`):** Abstracts TLS (`rustls`) and plain TCP stream handling, connection establishment, certificate validation, and binary frame encoding/decoding.
+- **Application Controller (`main.rs`):** Runs the background I/O worker thread and bridges network events to the Slint UI thread via `slint::invoke_from_event_loop`.
+
+While the graphical client is focused on direct user interaction, the architecture also supports headless clients, such as our multi-threaded test client (`testclient`) for automated regression testing and benchmarking, and potential future headless bot clients (e.g., automated document spell-checkers or document export tools).
 
 ## Server Design
 
@@ -48,5 +54,8 @@ The current protocol version is komon-1 and it is backwards compatible with the 
 * **`MET ` (Metrics):**
   * *Client -> Server:* `MET `
   * *Response:* `MET <json>` containing server connection count, messages processed, and error counters.
+* **`BYE ` (Disconnect / Teardown):**
+  * *Client -> Server:* `BYE ` (empty payload).
+  * *Behavior:* Notifies the server of a graceful disconnect; the server closes the session and cleans up resources.
 * **`ERR ` (Error Response):**
   * *Server -> Client:* `ERR <reason>` carrying the message ID of the triggering request.
