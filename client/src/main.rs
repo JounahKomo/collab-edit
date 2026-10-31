@@ -24,7 +24,7 @@ const LINES_PER_PAGE: usize = 35;
 #[command(
     author,
     version,
-    about = "CollabEdit - Collaborative Document Editor Client"
+    about = "CollabEdit - Collaborative Document Editor & Chat Client"
 )]
 struct Cli {
     /// Server address in host:port format
@@ -48,7 +48,41 @@ struct Cli {
     no_tls: bool,
 }
 
-fn sync_ui(ui: &AppWindow, state: &ClientDocState) {
+#[derive(Debug, Clone)]
+struct ClientChatState {
+    channels: Vec<String>,
+    active_channel: String,
+    messages: Vec<ChatMessage>,
+}
+
+impl Default for ClientChatState {
+    fn default() -> Self {
+        Self {
+            channels: vec!["general".to_string()],
+            active_channel: "general".to_string(),
+            messages: Vec::new(),
+        }
+    }
+}
+
+impl ClientChatState {
+    fn add_channel(&mut self, channel: &str) {
+        if !self.channels.iter().any(|c| c == channel) {
+            self.channels.push(channel.to_string());
+        }
+    }
+
+    fn add_message(&mut self, sender: &str, channel: &str, text: &str) {
+        self.add_channel(channel);
+        self.messages.push(ChatMessage {
+            sender: sender.into(),
+            channel: channel.into(),
+            text: text.into(),
+        });
+    }
+}
+
+fn sync_doc_ui(ui: &AppWindow, state: &ClientDocState) {
     ui.set_cursor_line(state.cursor_line as i32);
     ui.set_cursor_col(state.cursor_col as i32);
 
@@ -82,6 +116,24 @@ fn sync_ui(ui: &AppWindow, state: &ClientDocState) {
     ui.set_pages(slint::ModelRc::new(slint::VecModel::from(pages_vec)));
 }
 
+fn sync_chat_ui(ui: &AppWindow, chat: &ClientChatState) {
+    let ch_model: Vec<slint::SharedString> = chat
+        .channels
+        .iter()
+        .map(|c| slint::SharedString::from(c.as_str()))
+        .collect();
+    ui.set_channels(slint::ModelRc::new(slint::VecModel::from(ch_model)));
+    ui.set_active_channel(chat.active_channel.as_str().into());
+
+    let msg_model: Vec<ChatMessage> = chat
+        .messages
+        .iter()
+        .filter(|m| m.channel == chat.active_channel)
+        .cloned()
+        .collect();
+    ui.set_messages(slint::ModelRc::new(slint::VecModel::from(msg_model)));
+}
+
 fn next_msg_id(counter: &AtomicU32) -> u32 {
     let id = counter.fetch_add(2, Ordering::SeqCst);
     if id.is_multiple_of(2) {
@@ -94,18 +146,29 @@ fn next_msg_id(counter: &AtomicU32) -> u32 {
 #[derive(Clone)]
 struct ClientContext {
     ui: slint::Weak<AppWindow>,
-    state: Arc<Mutex<ClientDocState>>,
+    doc_state: Arc<Mutex<ClientDocState>>,
+    chat_state: Arc<Mutex<ClientChatState>>,
     tx_net: mpsc::Sender<Vec<u8>>,
     msg_counter: Arc<AtomicU32>,
 }
 
 impl ClientContext {
     /// Mutates the client document state, immediately refreshes the UI, and returns the callback's result.
-    fn with_state_mut<R>(&self, f: impl FnOnce(&mut ClientDocState) -> R) -> R {
-        let mut st = self.state.lock().unwrap();
+    fn with_doc_state_mut<R>(&self, f: impl FnOnce(&mut ClientDocState) -> R) -> R {
+        let mut st = self.doc_state.lock().unwrap();
         let res = f(&mut st);
         if let Some(ui) = self.ui.upgrade() {
-            sync_ui(&ui, &st);
+            sync_doc_ui(&ui, &st);
+        }
+        res
+    }
+
+    /// Mutates the client chat state and refreshes the chat UI.
+    fn with_chat_state_mut<R>(&self, f: impl FnOnce(&mut ClientChatState) -> R) -> R {
+        let mut ch = self.chat_state.lock().unwrap();
+        let res = f(&mut ch);
+        if let Some(ui) = self.ui.upgrade() {
+            sync_chat_ui(&ui, &ch);
         }
         res
     }
@@ -134,6 +197,7 @@ fn start_network_worker(
     rx_net: mpsc::Receiver<Vec<u8>>,
     ui_weak: slint::Weak<AppWindow>,
     doc_state_net: Arc<Mutex<ClientDocState>>,
+    chat_state_net: Arc<Mutex<ClientChatState>>,
 ) {
     thread::spawn(move || {
         let _ = stream
@@ -226,7 +290,26 @@ fn start_network_worker(
                         let _ = slint::invoke_from_event_loop(move || {
                             if let Some(ui) = ui_clone.upgrade() {
                                 let st = state_clone.lock().unwrap();
-                                sync_ui(&ui, &st);
+                                sync_doc_ui(&ui, &st);
+                            }
+                        });
+                    }
+                } else if msg_type == b"MSG " {
+                    // Protocol format: <sender> <channel> <message>
+                    let parsed = payload.split_once(' ').and_then(|(sender, rest)| {
+                        rest.split_once(' ').map(|(ch, t)| (sender, ch, t))
+                    });
+                    if let Some((sender, channel, text)) = parsed {
+                        let ui_clone = ui_weak.clone();
+                        let chat_clone = Arc::clone(&chat_state_net);
+                        let s = sender.to_string();
+                        let ch = channel.to_string();
+                        let t = text.to_string();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_clone.upgrade() {
+                                let mut chat = chat_clone.lock().unwrap();
+                                chat.add_message(&s, &ch, &t);
+                                sync_chat_ui(&ui, &chat);
                             }
                         });
                     }
@@ -265,7 +348,7 @@ fn register_ui_callbacks(ui: &AppWindow, ctx: ClientContext) {
         if text.is_empty() || text.chars().any(|c| c.is_control()) {
             return;
         }
-        let (line, col) = ctx_key.with_state_mut(|st| {
+        let (line, col) = ctx_key.with_doc_state_mut(|st| {
             let line = st.cursor_line;
             let col = st.cursor_col;
             st.insert_text(&text);
@@ -276,7 +359,7 @@ fn register_ui_callbacks(ui: &AppWindow, ctx: ClientContext) {
 
     let ctx_enter = ctx.clone();
     ui.on_enter_pressed(move || {
-        let (line, col) = ctx_enter.with_state_mut(|st| {
+        let (line, col) = ctx_enter.with_doc_state_mut(|st| {
             let line = st.cursor_line;
             let col = st.cursor_col;
             st.insert_newline();
@@ -287,7 +370,7 @@ fn register_ui_callbacks(ui: &AppWindow, ctx: ClientContext) {
 
     let ctx_backspace = ctx.clone();
     ui.on_backspace_pressed(move || {
-        let del_op = ctx_backspace.with_state_mut(|st| st.backspace());
+        let del_op = ctx_backspace.with_doc_state_mut(|st| st.backspace());
         if let Some((line, col, count)) = del_op {
             ctx_backspace.send_frame(b"DEL ", &format!("{} {} {}", line, col, count));
         }
@@ -295,17 +378,45 @@ fn register_ui_callbacks(ui: &AppWindow, ctx: ClientContext) {
 
     let ctx_arrow = ctx.clone();
     ui.on_arrow_pressed(move |dir| {
-        ctx_arrow.with_state_mut(|st| {
+        ctx_arrow.with_doc_state_mut(|st| {
             st.move_cursor(&dir);
         });
     });
 
-    let ctx_click = ctx;
+    let ctx_click = ctx.clone();
     ui.on_cursor_position_clicked(move |line, col| {
         if line >= 0 && col >= 0 {
-            ctx_click.with_state_mut(|st| {
+            ctx_click.with_doc_state_mut(|st| {
                 st.set_cursor_pos(line as usize, col as usize);
             });
+        }
+    });
+
+    let ctx_select_ch = ctx.clone();
+    ui.on_channel_selected(move |channel| {
+        ctx_select_ch.with_chat_state_mut(|ch| {
+            ch.active_channel = channel.to_string();
+        });
+    });
+
+    let ctx_send_msg = ctx.clone();
+    ui.on_send_chat_message(move |channel, text| {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            ctx_send_msg.send_frame(b"MSG ", &format!("{} {}", channel, trimmed));
+        }
+    });
+
+    let ctx_add_ch = ctx;
+    ui.on_add_channel_submitted(move |new_channel| {
+        let trimmed = new_channel.trim().to_string();
+        if !trimmed.is_empty() {
+            ctx_add_ch.with_chat_state_mut(|ch| {
+                ch.add_channel(&trimmed);
+                ch.active_channel = trimmed.clone();
+            });
+            // Send initial ping to create the channel on the server
+            ctx_add_ch.send_frame(b"MSG ", &format!("{} joined channel #{}", trimmed, trimmed));
         }
     });
 }
@@ -331,18 +442,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ui = AppWindow::new()?;
     let doc_state = Arc::new(Mutex::new(ClientDocState::new()));
+    let chat_state = Arc::new(Mutex::new(ClientChatState::default()));
     let msg_counter = Arc::new(AtomicU32::new(1));
     let (tx_net, rx_net) = mpsc::channel::<Vec<u8>>();
 
     // Initial UI sync
     {
         let st = doc_state.lock().unwrap();
-        sync_ui(&ui, &st);
+        sync_doc_ui(&ui, &st);
+        let ch = chat_state.lock().unwrap();
+        sync_chat_ui(&ui, &ch);
     }
 
     let ctx = ClientContext {
         ui: ui.as_weak(),
-        state: Arc::clone(&doc_state),
+        doc_state: Arc::clone(&doc_state),
+        chat_state: Arc::clone(&chat_state),
         tx_net: tx_net.clone(),
         msg_counter: Arc::clone(&msg_counter),
     };
@@ -361,7 +476,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Launch background network thread
-    start_network_worker(stream, rx_net, ui.as_weak(), Arc::clone(&doc_state));
+    start_network_worker(
+        stream,
+        rx_net,
+        ui.as_weak(),
+        Arc::clone(&doc_state),
+        Arc::clone(&chat_state),
+    );
 
     // Register user input event callbacks
     register_ui_callbacks(&ui, ctx.clone());

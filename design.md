@@ -8,11 +8,18 @@ The editor organizes text as a free-form document grid constrained to a standard
 
 ## Clients
 
-The primary client is a graphical desktop application developed in Rust using the **Slint** GUI toolkit (`slint` crate). The Slint UI provides an initial username login dialog, a multi-page document layout (automatically creating new standard-sized pages as line count grows, similar to Microsoft Word or Google Docs), monospace text rendering, a visual cursor indicator for the current user position, mouse-click cursor positioning, and a status bar displaying session status, active page count (`Page X of Y`), and cursor coordinates. Under the hood, the client architecture is modularly separated:
-- **UI Layer (`ui/app-window.slint`):** Handles visual styling, login prompt dialog, multi-page document layout with page sheets and dropshadows, captures mouse clicks to position the cursor on any line/column, and captures keyboard events (keystrokes, Enter line splits, Backspace deletions, and arrow key navigation).
+The primary client is a graphical desktop application developed in Rust using the **Slint** GUI toolkit (`slint` crate). The Slint UI provides an initial username login dialog, a status bar with connection state and cursor coordinates, and a responsive three-column desktop workspace:
+
+1. **Channels Sidebar (Left):** Displays the list of available text channels (starting with `#general`), highlights the currently selected active channel, and features a `+` button that reveals a channel creation input field and `Add` button to dynamically create and join new channels on the fly.
+2. **Document Editor (Center):** A multi-page document layout (automatically creating new standard-sized pages as line count grows, similar to Microsoft Word or Google Docs), monospace text rendering, a visual cursor indicator for the current user position, mouse-click cursor positioning, and page metadata (`Page X of Y`).
+3. **Channel Chat Panel (Right):** Displays the active channel name (`# <channel>`), a scrollable chat history containing messages sent to that specific channel (styled with distinct sender tags and message bubbles), and an input field with a `Send` button allowing users to send messages directly into the active channel.
+
+Under the hood, the client architecture is modularly separated:
+- **UI Layer (`ui/app-window.slint`):** Handles visual styling, login prompt dialog, channels sidebar with dynamic channel creation dialog, multi-page document layout with page sheets and dropshadows, channel-filtered chat history and input bar, mouse click coordinate translation, and keyboard event capture (keystrokes, Enter line splits, Backspace deletions, and arrow key navigation).
 - **Document State (`doc_state.rs`):** Tracks local document lines, cursor coordinates, and revision numbers, handling optimistic local line-splitting, line-merging, direct cursor repositioning (`set_cursor_pos`), and server revision state reconciliation.
+- **Chat State (`main.rs` - `ClientChatState`):** Tracks registered channels, active channel selection, and incoming chat messages, ensuring channel lists and active channel message views stay synchronized with server broadcasts.
 - **Networking Layer (`net.rs`):** Abstracts TLS (`rustls`) and plain TCP stream handling, connection establishment, certificate validation, and binary frame encoding/decoding.
-- **Application Controller (`main.rs`):** Chunks linear document lines into page data (`LINES_PER_PAGE = 35`), wires click and keyboard callbacks, runs the background I/O worker thread, and bridges network events to the Slint UI thread via `slint::invoke_from_event_loop`.
+- **Application Controller (`main.rs`):** Chunks linear document lines into page data (`LINES_PER_PAGE = 35`), wires click, keyboard, channel selection, and chat message callbacks, runs the background I/O worker thread, and bridges network events to the Slint UI thread via `slint::invoke_from_event_loop`.
 
 While the graphical client is focused on direct user interaction, the architecture also supports headless clients, such as our multi-threaded test client (`testclient`) for automated regression testing and benchmarking, and potential future headless bot clients (e.g., automated document spell-checkers or document export tools).
 

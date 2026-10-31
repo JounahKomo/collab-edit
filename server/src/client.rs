@@ -528,7 +528,6 @@ mod tests {
         "127.0.0.1:1".parse().unwrap()
     }
 
-
     #[test]
     fn dynamic_channel_creation() {
         let mut state = State::default();
@@ -555,7 +554,10 @@ mod tests {
         assert!(state.channels.contains("announcements"));
 
         // Sender receives echo with server-allocated id
-        assert_eq!(a.write_buf, frame(2, b"MSG ", b"alice announcements Hello all!"));
+        assert_eq!(
+            a.write_buf,
+            frame(2, b"MSG ", b"alice announcements Hello all!")
+        );
 
         // Bob receives the broadcast message on "announcements"
         assert_eq!(

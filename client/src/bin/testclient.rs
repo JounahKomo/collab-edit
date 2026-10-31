@@ -578,10 +578,15 @@ fn run_connection(index: usize, total: usize, config: &ConnectionConfig) -> Repo
 
                 if index == 0 {
                     // Connection 0 sends a message to an unrecognized channel name
-                    s.write_all(&create_message(25, "MSG ", &format!("{channel_name} {msg_text}")))?;
+                    s.write_all(&create_message(
+                        25,
+                        "MSG ",
+                        &format!("{channel_name} {msg_text}"),
+                    ))?;
                     s.flush()?;
                     let (len, id, ty, payload) = decode_message(&read_frame(s)?);
-                    let expected_echo = format!("{}0 {channel_name} {msg_text}", config.user_prefix);
+                    let expected_echo =
+                        format!("{}0 {channel_name} {msg_text}", config.user_prefix);
                     r.check(
                         "MSG to new channel dynamically creates channel and echoes to sender",
                         ty == "MSG "
@@ -592,7 +597,8 @@ fn run_connection(index: usize, total: usize, config: &ConnectionConfig) -> Repo
                 } else {
                     // Other connections receive the broadcast on the dynamically created channel
                     let (len, id, ty, payload) = decode_message(&read_frame(s)?);
-                    let expected_broadcast = format!("{}0 {channel_name} {msg_text}", config.user_prefix);
+                    let expected_broadcast =
+                        format!("{}0 {channel_name} {msg_text}", config.user_prefix);
                     r.check(
                         "peers receive broadcast from dynamically created channel",
                         ty == "MSG "
