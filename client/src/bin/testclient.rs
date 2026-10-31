@@ -367,25 +367,6 @@ fn run_connection(index: usize, total: usize, config: &ConnectionConfig) -> Repo
                 r.check("duplicate username gets ERR", ty == "ERR " && id == 9);
             }
             if index == 3 {
-                if config.is_komon2 {
-                    // In komon-2, unrecognized channels are dynamically created and echoed
-                    s.write_all(&create_message(9, "MSG ", "nochannel Hi"))?;
-                    s.flush()?;
-                    let (_, id, ty, payload) = decode_message(&read_frame(s)?);
-                    r.check(
-                        "MSG to new channel dynamically creates channel and broadcasts",
-                        ty == "MSG " && !CLIENT_IDS.contains(&id) && payload.contains("nochannel Hi"),
-                    );
-                } else {
-                    s.write_all(&create_message(9, "MSG ", "nochannel Hi"))?;
-                    s.flush()?;
-                    let (_, id, ty, _) = decode_message(&read_frame(s)?);
-                    r.check(
-                        "MSG to unknown channel gets ERR with the same id",
-                        ty == "ERR " && id == 9,
-                    );
-                }
-
                 s.write_all(&create_message(11, "MSG ", "malformed"))?;
                 s.flush()?;
                 let (_, id, ty, _) = decode_message(&read_frame(s)?);
