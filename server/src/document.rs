@@ -34,7 +34,8 @@ impl Document {
     ///   padded with empty lines up to `line`.
     /// - `col` must be <= `MAX_COLUMNS`.
     /// - If `col` exceeds the current line length, spaces are automatically padded up to `col`.
-    /// - No line in the document may exceed `MAX_COLUMNS` characters after insertion.
+    /// - When any line exceeds `MAX_COLUMNS`, characters overflowing the column limit
+    ///   cascade and wrap into subsequent lines.
     pub fn insert(&mut self, line: usize, col: usize, text: &str) -> Result<(), &'static str> {
         if col > MAX_COLUMNS {
             return Err("Column exceeds maximum line width");
@@ -56,24 +57,11 @@ impl Document {
         let suffix: String = self.lines[line].chars().skip(col).collect();
 
         if !text.contains('\n') {
-            let new_line = format!("{}{}{}", prefix, text, suffix);
-            if new_line.chars().count() > MAX_COLUMNS {
-                return Err("Line exceeds maximum column width");
-            }
-            self.lines[line] = new_line;
+            self.lines[line] = format!("{}{}{}", prefix, text, suffix);
         } else {
             let parts: Vec<&str> = text.split('\n').collect();
             let first_line = format!("{}{}", prefix, parts[0]);
             let last_line = format!("{}{}", parts.last().unwrap(), suffix);
-
-            if first_line.chars().count() > MAX_COLUMNS || last_line.chars().count() > MAX_COLUMNS {
-                return Err("Line exceeds maximum column width");
-            }
-            for &part in &parts[1..parts.len() - 1] {
-                if part.chars().count() > MAX_COLUMNS {
-                    return Err("Line exceeds maximum column width");
-                }
-            }
 
             self.lines[line] = first_line;
             for (idx, &part) in parts[1..parts.len() - 1].iter().enumerate() {
@@ -83,6 +71,7 @@ impl Document {
             self.lines.insert(last_idx, last_line);
         }
 
+        self.wrap_lines_from(line);
         self.revision += 1;
         Ok(())
     }
@@ -141,8 +130,30 @@ impl Document {
             }
         }
 
+        self.wrap_lines_from(line);
         self.revision += 1;
         Ok(())
+    }
+
+    /// Cascading wrap for any lines that exceed MAX_COLUMNS (80), prepending
+    /// overflowing characters into the next line.
+    fn wrap_lines_from(&mut self, start_line: usize) {
+        let mut cur_line = start_line;
+        while cur_line < self.lines.len() {
+            let char_count = self.lines[cur_line].chars().count();
+            if char_count > MAX_COLUMNS {
+                let kept: String = self.lines[cur_line].chars().take(MAX_COLUMNS).collect();
+                let overflow: String = self.lines[cur_line].chars().skip(MAX_COLUMNS).collect();
+                self.lines[cur_line] = kept;
+                if cur_line + 1 < self.lines.len() {
+                    let next_line = format!("{}{}", overflow, self.lines[cur_line + 1]);
+                    self.lines[cur_line + 1] = next_line;
+                } else {
+                    self.lines.push(overflow);
+                }
+            }
+            cur_line += 1;
+        }
     }
 }
 
@@ -193,15 +204,53 @@ mod tests {
         doc.insert(0, 0, &long_string).unwrap();
         assert_eq!(doc.lines[0].chars().count(), MAX_COLUMNS);
 
-        // Exceeding MAX_COLUMNS by 1
-        assert_eq!(
-            doc.insert(0, MAX_COLUMNS, "b"),
-            Err("Line exceeds maximum column width")
-        );
+        // Exceeding MAX_COLUMNS by inserting at MAX_COLUMNS wraps to line 1
+        doc.insert(0, MAX_COLUMNS, "b").unwrap();
+        assert_eq!(doc.lines.len(), 2);
+        assert_eq!(doc.lines[0], "a".repeat(MAX_COLUMNS));
+        assert_eq!(doc.lines[1], "b");
+
+        // Column > MAX_COLUMNS still returns bounds error
         assert_eq!(
             doc.insert(0, MAX_COLUMNS + 1, "b"),
             Err("Column exceeds maximum line width")
         );
+    }
+
+    #[test]
+    fn test_column_wrapping_cascade() {
+        let mut doc = Document::new();
+        // Insert 80 'a's on line 0, 80 'b's on line 1
+        doc.insert(0, 0, &"a".repeat(MAX_COLUMNS)).unwrap();
+        doc.insert(1, 0, &"b".repeat(MAX_COLUMNS)).unwrap();
+        assert_eq!(doc.lines.len(), 2);
+
+        // Insert "XYZ" at col 40 of line 0
+        // Line 0 becomes 80 chars: 40 'a's + "XYZ" + 37 'a's
+        // 3 'a's overflow to line 1
+        // Line 1 becomes 80 chars: 3 'a's + 77 'b's
+        // 3 'b's overflow to line 2
+        // Line 2 becomes "bbb"
+        doc.insert(0, 40, "XYZ").unwrap();
+        assert_eq!(doc.lines.len(), 3);
+        assert_eq!(doc.lines[0].chars().count(), MAX_COLUMNS);
+        assert_eq!(doc.lines[1].chars().count(), MAX_COLUMNS);
+        assert_eq!(doc.lines[2], "bbb");
+    }
+
+    #[test]
+    fn test_column_wrapping_utf8() {
+        let mut doc = Document::new();
+        // 79 Finnish characters + 1 emoji = 80 chars
+        let content = format!("{}{}", "ä".repeat(79), "🦀");
+        doc.insert(0, 0, &content).unwrap();
+        assert_eq!(doc.lines[0].chars().count(), 80);
+
+        // Inserting "ö" should wrap the emoji "🦀" to the next line
+        doc.insert(0, 79, "ö").unwrap();
+        assert_eq!(doc.lines.len(), 2);
+        assert_eq!(doc.lines[0].chars().count(), 80);
+        assert_eq!(doc.lines[1], "🦀");
     }
 
     #[test]

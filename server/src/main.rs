@@ -31,7 +31,7 @@ struct Cli {
     port: u16,
 
     /// Bind IP address
-    #[arg(short, long, default_value = "0.0.0.0", env = "HOST")]
+    #[arg(short = 'H', long, default_value = "0.0.0.0", env = "HOST")]
     host: String,
 
     /// Path to the TLS certificate (.crt / .pem)

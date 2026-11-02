@@ -4,7 +4,7 @@
 
 The project is a real-time collaborative document editor written in Rust. It enables multiple concurrent users to connect over an encrypted network connection (TLS) to collaboratively view, edit, and interact on a shared text document simultaneously. The core goal is to provide a responsive, synchronized multi-user editing experience with minimal latency and strict consistency.
 
-The editor organizes text as a free-form document grid constrained to a standard page width (fixed at 80 columns, representative of font size 12 on standard margins). Key features include live text insertion and deletion, automatic line expansion, document revision tracking, full-state synchronization broadcasts on updates, and chat communication across channels. In future iterations, the editor will also display real-time interactive remote cursors showing peer positions.
+The editor organizes text as a free-form document grid constrained to a standard page width (fixed at 80 columns, representative of font size 12 on standard margins). Key features include live text insertion and deletion, automatic line expansion, line wrapping at column 80, document revision tracking, full-state synchronization broadcasts on updates, and chat communication across channels. In future iterations, the editor will also display real-time interactive remote cursors showing peer positions.
 
 ## Clients
 
@@ -16,7 +16,7 @@ The primary client is a graphical desktop application developed in Rust using th
 
 Under the hood, the client architecture is modularly separated:
 - **UI Layer (`ui/app-window.slint`):** Handles visual styling, login prompt dialog, channels sidebar with dynamic channel creation dialog, multi-page document layout with page sheets and dropshadows, channel-filtered chat history and input bar, mouse click coordinate translation, and keyboard event capture (keystrokes, Enter line splits, Backspace deletions, and arrow key navigation).
-- **Document State (`doc_state.rs`):** Tracks local document lines, cursor coordinates, and revision numbers, handling optimistic local line-splitting, line-merging, direct cursor repositioning (`set_cursor_pos`), and server revision state reconciliation.
+- **Document State (`doc_state.rs`):** Tracks local document lines, cursor coordinates, and revision numbers, handling optimistic local line-splitting, cascading line wrapping past column 80, line-merging, direct cursor repositioning (`set_cursor_pos`), and server revision state reconciliation.
 - **Chat State (`main.rs` - `ClientChatState`):** Tracks registered channels, active channel selection, and incoming chat messages, ensuring channel lists and active channel message views stay synchronized with server broadcasts.
 - **Networking Layer (`net.rs`):** Abstracts TLS (`rustls`) and plain TCP stream handling, connection establishment, certificate validation, and binary frame encoding/decoding.
 - **Application Controller (`main.rs`):** Chunks linear document lines into page data (`LINES_PER_PAGE = 35`), wires click, keyboard, channel selection, and chat message callbacks, runs the background I/O worker thread, and bridges network events to the Slint UI thread via `slint::invoke_from_event_loop`.
@@ -48,7 +48,7 @@ The current protocol version is **`komon-2`** and it is backwards compatible wit
   * *Broadcast:* When a document mutation occurs, the server broadcasts `GET <revision>\n<document_content>` to all registered clients using server-allocated message IDs.
 * **`INS ` (Insert Text):**
   * *Client -> Server:* `INS <line> <col> <text>`
-  * *Response:* Echoes the `INS` frame back on success (and triggers a document `GET` broadcast), or returns `ERR` if line/column bounds or line width limits (max 80 columns) are exceeded.
+  * *Response:* Echoes the `INS` frame back on success (and triggers a document `GET` broadcast), or returns `ERR` if line/column bounds (target column `> 80`) are exceeded. If text insertion causes any line to exceed the 80 column limit, overflowing characters automatically cascade and wrap into subsequent lines.
 * **`DEL ` (Delete Text):**
   * *Client -> Server:* `DEL <line> <col> <count>`
   * *Response:* Echoes the `DEL` frame back on success (and triggers a document `GET` broadcast), or returns `ERR` if the coordinates or count are invalid.

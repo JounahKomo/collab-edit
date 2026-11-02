@@ -1,5 +1,8 @@
 //! Document state management for the CollabEdit client.
 
+/// Maximum number of characters (columns) per line, matching the server's limit.
+pub const MAX_COLUMNS: usize = 80;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientDocState {
     pub lines: Vec<String>,
@@ -115,15 +118,30 @@ impl ClientDocState {
         }
     }
 
-    /// Inserts single-line text at the current cursor position and advances the cursor column.
+    /// Inserts single-line text at the current cursor position, wrapping overflowing
+    /// characters across subsequent lines at MAX_COLUMNS (80), and advances the cursor.
     pub fn insert_text(&mut self, text: &str) {
         self.clamp_cursor();
-        let line = &mut self.lines[self.cursor_line];
-        let col = self.cursor_col;
-        let prefix: String = line.chars().take(col).collect();
-        let suffix: String = line.chars().skip(col).collect();
+        let target_line = self.cursor_line;
+        let target_col = self.cursor_col;
+
+        let line = &mut self.lines[target_line];
+        let prefix: String = line.chars().take(target_col).collect();
+        let suffix: String = line.chars().skip(target_col).collect();
         *line = format!("{}{}{}", prefix, text, suffix);
-        self.cursor_col += text.chars().count();
+
+        // Advance cursor, wrapping to next line(s) if exceeding MAX_COLUMNS
+        let mut c_line = target_line;
+        let mut c_col = target_col + text.chars().count();
+        while c_col > MAX_COLUMNS {
+            c_line += 1;
+            c_col -= MAX_COLUMNS;
+        }
+
+        self.wrap_lines_from(target_line);
+        self.cursor_line = c_line;
+        self.cursor_col = c_col;
+        self.clamp_cursor();
     }
 
     /// Inserts a newline at the cursor, splitting the current line and moving to (line + 1, col 0).
@@ -159,9 +177,32 @@ impl ClientDocState {
             self.lines[prev_line_idx].push_str(&cur_line);
             self.cursor_line = prev_line_idx;
             self.cursor_col = prev_len;
+            self.wrap_lines_from(prev_line_idx);
+            self.clamp_cursor();
             Some((prev_line_idx, prev_len, 1))
         } else {
             None
+        }
+    }
+
+    /// Cascading wrap for any lines that exceed MAX_COLUMNS (80), prepending
+    /// overflowing characters into the next line.
+    pub fn wrap_lines_from(&mut self, start_line: usize) {
+        let mut cur_line = start_line;
+        while cur_line < self.lines.len() {
+            let char_count = self.lines[cur_line].chars().count();
+            if char_count > MAX_COLUMNS {
+                let kept: String = self.lines[cur_line].chars().take(MAX_COLUMNS).collect();
+                let overflow: String = self.lines[cur_line].chars().skip(MAX_COLUMNS).collect();
+                self.lines[cur_line] = kept;
+                if cur_line + 1 < self.lines.len() {
+                    let next_line = format!("{}{}", overflow, self.lines[cur_line + 1]);
+                    self.lines[cur_line + 1] = next_line;
+                } else {
+                    self.lines.push(overflow);
+                }
+            }
+            cur_line += 1;
         }
     }
 }
@@ -221,6 +262,43 @@ mod tests {
         assert_eq!(state.lines, vec!["hello ", "world"]);
         assert_eq!(state.cursor_line, 1);
         assert_eq!(state.cursor_col, 0);
+    }
+
+    #[test]
+    fn test_insert_text_wrapping() {
+        let mut state = ClientDocState::new();
+        let s = "a".repeat(MAX_COLUMNS);
+        state.insert_text(&s);
+        assert_eq!(state.lines.len(), 1);
+        assert_eq!(state.lines[0].chars().count(), MAX_COLUMNS);
+        assert_eq!(state.cursor_line, 0);
+        assert_eq!(state.cursor_col, MAX_COLUMNS);
+
+        // Typing another character at column 80 wraps to line 1, col 1
+        state.insert_text("b");
+        assert_eq!(state.lines.len(), 2);
+        assert_eq!(state.lines[0], "a".repeat(MAX_COLUMNS));
+        assert_eq!(state.lines[1], "b");
+        assert_eq!(state.cursor_line, 1);
+        assert_eq!(state.cursor_col, 1);
+    }
+
+    #[test]
+    fn test_insert_text_cascade_wrapping() {
+        let mut state = ClientDocState::new();
+        state.lines = vec!["a".repeat(MAX_COLUMNS), "b".repeat(MAX_COLUMNS)];
+        state.cursor_line = 0;
+        state.cursor_col = 40;
+
+        // Inserting "XYZ" at col 40 of line 0
+        state.insert_text("XYZ");
+        assert_eq!(state.lines.len(), 3);
+        assert_eq!(state.lines[0].chars().count(), MAX_COLUMNS);
+        assert_eq!(state.lines[1].chars().count(), MAX_COLUMNS);
+        assert_eq!(state.lines[2], "bbb");
+        // Cursor was at col 40, advanced by 3 to col 43 on line 0
+        assert_eq!(state.cursor_line, 0);
+        assert_eq!(state.cursor_col, 43);
     }
 
     #[test]
