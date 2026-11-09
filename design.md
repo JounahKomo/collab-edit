@@ -67,3 +67,7 @@ The current protocol version is **`komon-2`** and it is backwards compatible wit
   * *Behavior:* Notifies the server of a graceful disconnect; the server closes the session and cleans up resources.
 * **`ERR ` (Error Response):**
   * *Server -> Client:* `ERR <reason>` carrying the message ID of the triggering request.
+
+## Development & Tooling
+
+Antigravity was used as an AI assistant in the development of the project, assisting with system architecture design, protocol implementation, client/server debugging, and automated test suite creation.
