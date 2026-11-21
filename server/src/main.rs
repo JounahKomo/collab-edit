@@ -1,24 +1,13 @@
-use std::{
-    fs::File,
-    io::{self, BufReader},
-    net::SocketAddr,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{io, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use clap::Parser;
-use rustls_pki_types::{CertificateDer, PrivateKeyDer};
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{TcpListener, UdpSocket},
-    sync::mpsc,
-};
+use tokio::net::{TcpListener, UdpSocket};
 use tokio_rustls::TlsAcceptor;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use server::client::{
-    Client, ClientHandle, ClientId, SharedState, cursor_snapshot, handle_udp_datagram,
+use server::{
+    connection::run_accept_loop, state::SharedState, tls::load_tls_acceptor, udp::spawn_udp_tasks,
 };
 
 #[derive(Parser, Debug)]
@@ -51,37 +40,10 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .init();
-
+    init_tracing();
     let cli = Cli::parse();
 
-    let acceptor: Option<TlsAcceptor> = if cli.no_tls {
-        info!("TLS disabled via --no-tls");
-        None
-    } else {
-        match load_tls_acceptor(&cli.cert, &cli.key) {
-            Ok(acc) => {
-                info!(
-                    "Loaded TLS configuration from cert={:?}, key={:?}",
-                    cli.cert, cli.key
-                );
-                Some(acc)
-            }
-            Err(e) => {
-                error!(
-                    "Failed to load TLS credentials (cert: {:?}, key: {:?}): {e}",
-                    cli.cert, cli.key
-                );
-                return Err(e);
-            }
-        }
-    };
-
+    let acceptor = build_acceptor(&cli)?;
     let address: SocketAddr = format!("{}:{}", cli.host, cli.port)
         .parse()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
@@ -89,51 +51,12 @@ async fn main() -> io::Result<()> {
     let listener = TcpListener::bind(address)
         .await
         .inspect_err(|e| error!("Failed to bind TCP listener to {address}: {e}"))?;
+    // Cursor updates (`CUR`) travel over UDP on the same port number as TCP.
+    let udp = UdpSocket::bind(address)
+        .await
+        .inspect_err(|e| error!("Failed to bind UDP socket to {address}: {e}"))?;
 
     let state = SharedState::default();
-
-    // Cursor updates (`CUR`) travel over UDP on the same port number as TCP.
-    let udp = Arc::new(
-        UdpSocket::bind(address)
-            .await
-            .inspect_err(|e| error!("Failed to bind UDP socket to {address}: {e}"))?,
-    );
-    {
-        let udp = udp.clone();
-        let state = state.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
-            loop {
-                tick.tick().await;
-                let out = cursor_snapshot(&mut state.lock());
-                for (addr, data) in out {
-                    let _ = udp.send_to(&data, addr).await;
-                }
-            }
-        });
-    }
-    {
-        let udp = udp.clone();
-        let state = state.clone();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 2048];
-            loop {
-                match udp.recv_from(&mut buf).await {
-                    Ok((n, src)) => {
-                        let out = handle_udp_datagram(&mut state.lock(), src, &buf[..n]);
-                        for (addr, data) in out {
-                            if let Err(e) = udp.send_to(&data, addr).await {
-                                warn!("Failed sending UDP datagram to {addr}: {e}");
-                            }
-                        }
-                    }
-                    Err(e) => warn!("UDP receive error: {e}"),
-                }
-            }
-        });
-    }
-    let mut next_client_id: ClientId = 1;
-
     info!(
         "Server listening on {} (TLS: {})",
         address,
@@ -144,125 +67,39 @@ async fn main() -> io::Result<()> {
         }
     );
 
-    loop {
-        match listener.accept().await {
-            Ok((socket, peer)) => {
-                info!("Accepted TCP connection from: {}", peer);
-                let id = next_client_id;
-                next_client_id += 1;
+    spawn_udp_tasks(Arc::new(udp), state.clone());
+    run_accept_loop(listener, acceptor, state).await;
+    Ok(())
+}
 
-                state.lock().metrics.connections_total += 1;
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
+}
 
-                if let Err(e) = socket.set_nodelay(true) {
-                    warn!("Failed to set TCP_NODELAY for {peer}: {e}");
-                }
-
-                let acceptor = acceptor.clone();
-                let state_clone = state.clone();
-
-                tokio::spawn(async move {
-                    if let Some(acceptor) = acceptor {
-                        match acceptor.accept(socket).await {
-                            Ok(tls_stream) => {
-                                handle_connection(tls_stream, peer, id, state_clone).await;
-                            }
-                            Err(e) => {
-                                warn!("TLS handshake failed with {peer}: {e}");
-                                state_clone.lock().metrics.errors += 1;
-                            }
-                        }
-                    } else {
-                        handle_connection(socket, peer, id, state_clone).await;
-                    }
-                });
-            }
-            Err(e) => {
-                error!("Error accepting connection: {e}");
-                state.lock().metrics.errors += 1;
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
+/// Loads the TLS configuration unless TLS is disabled.
+fn build_acceptor(cli: &Cli) -> io::Result<Option<TlsAcceptor>> {
+    if cli.no_tls {
+        info!("TLS disabled via --no-tls");
+        return Ok(None);
+    }
+    match load_tls_acceptor(&cli.cert, &cli.key) {
+        Ok(acceptor) => {
+            info!(
+                "Loaded TLS configuration from cert={:?}, key={:?}",
+                cli.cert, cli.key
+            );
+            Ok(Some(acceptor))
+        }
+        Err(e) => {
+            error!(
+                "Failed to load TLS credentials (cert: {:?}, key: {:?}): {e}",
+                cli.cert, cli.key
+            );
+            Err(e)
         }
     }
-}
-
-async fn handle_connection<S>(mut stream: S, address: SocketAddr, id: ClientId, state: SharedState)
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    state.lock().clients.insert(id, ClientHandle::new(tx));
-
-    let mut client = Client::new(id, address);
-
-    loop {
-        tokio::select! {
-            res = stream.read_buf(&mut client.read_buf) => match res {
-                Ok(0) => client.is_closed = true,
-                Ok(_) => {
-                    let mut guard = state.lock();
-                    client.process_messages(&mut guard);
-                }
-                Err(err) => {
-                    client.is_closed = true;
-                    warn!("Failed reading from client {}: {}", client.address, err);
-                    state.lock().metrics.errors += 1;
-                }
-            },
-            Some(msg) = rx.recv() => client.write_buf.extend_from_slice(&msg),
-        }
-
-        if !client.write_buf.is_empty() {
-            if let Err(err) = stream.write_all(&client.write_buf).await {
-                client.is_closed = true;
-                warn!("Failed writing to client {}: {}", client.address, err);
-                state.lock().metrics.errors += 1;
-            }
-            client.write_buf.clear();
-        }
-
-        if client.is_closed {
-            break;
-        }
-    }
-
-    state.lock().clients.remove(&id);
-    info!("Connection closed: {}", client.address);
-}
-
-fn load_tls_acceptor(cert_path: &Path, key_path: &Path) -> io::Result<TlsAcceptor> {
-    let certs = load_certs(cert_path)?;
-    let key = load_key(key_path)?;
-
-    let server_config = tokio_rustls::rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-
-    Ok(TlsAcceptor::from(Arc::new(server_config)))
-}
-
-fn load_certs(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let certs: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
-    if certs.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("No certificates found in {:?}", path),
-        ));
-    }
-    Ok(certs)
-}
-
-fn load_key(path: &Path) -> io::Result<PrivateKeyDer<'static>> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let key = rustls_pemfile::private_key(&mut reader)?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("No private key found in {:?}", path),
-        )
-    })?;
-    Ok(key)
 }

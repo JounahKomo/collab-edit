@@ -17,16 +17,30 @@ The primary client is a graphical desktop application developed in Rust using th
 Under the hood, the client architecture is modularly separated:
 - **UI Layer (`ui/app-window.slint`):** Handles visual styling, login prompt dialog, channels sidebar with dynamic channel creation dialog, multi-page document layout with page sheets and dropshadows, channel-filtered chat history and input bar, mouse click coordinate translation, and keyboard event capture (keystrokes, Enter line splits, Backspace deletions, and arrow key navigation).
 - **Document State (`doc_state.rs`):** Tracks local document lines, cursor coordinates, and revision numbers, handling optimistic local line-splitting, cascading line wrapping past column 80, line-merging, direct cursor repositioning (`set_cursor_pos`), and server revision state reconciliation.
-- **Chat State (`main.rs` - `ClientChatState`):** Tracks registered channels, active channel selection, and incoming chat messages, ensuring channel lists and active channel message views stay synchronized with server broadcasts.
+- **Chat State (`chat_state.rs` - `ClientChatState`):** Tracks registered channels, active channel selection, and incoming chat messages, ensuring channel lists and active channel message views stay synchronized with server broadcasts.
+- **UI Sync (`ui_sync.rs`):** Pushes document and chat state into the Slint UI, chunking linear document lines into page data (`LINES_PER_PAGE = 35`).
 - **Cursor Sharing (`cursors.rs`):** Sends the local cursor over UDP whenever it moves, receives the other users' cursors, expires stale ones, and feeds them to the UI, which draws a coloured cursor bar with a name tag per remote user.
 - **Networking Layer (`net.rs`):** Abstracts TLS (`rustls`) and plain TCP stream handling, connection establishment, certificate validation, and binary frame encoding/decoding.
-- **Application Controller (`main.rs`):** Chunks linear document lines into page data (`LINES_PER_PAGE = 35`), wires click, keyboard, channel selection, and chat message callbacks, runs the background I/O worker thread, and bridges network events to the Slint UI thread via `slint::invoke_from_event_loop`.
+- **Network Worker (`worker.rs`):** Runs the background I/O thread that writes queued frames, reads and decodes server frames (`USR`, `GET`, `MSG`, `ERR`), announces the UDP token after login, and bridges network events to the Slint UI thread via `slint::invoke_from_event_loop`.
+- **Client Context & Callbacks (`context.rs`, `callbacks.rs`):** `ClientContext` bundles the shared state, UI handle, send channel and message ID generator; `callbacks.rs` wires click, keyboard, channel selection, and chat message callbacks to document edits and network sends.
+- **Entry Point (`main.rs`):** Parses the command line, connects, opens the UDP socket, creates the shared state, and starts the worker threads and the UI.
 
 While the graphical client is focused on direct user interaction, the architecture also supports headless clients, such as our multi-threaded test client (`testclient`) for automated regression testing and benchmarking, and potential future headless bot clients (e.g., automated document spell-checkers or document export tools).
 
 ## Server Design
 
 *(A comprehensive server design description will be added in a subsequent iteration following further architectural discussions on concurrency, state persistence, and conflict resolution options.)*
+
+The server code is split into modules as well:
+- **`main.rs`:** Command line parsing, TLS/UDP/TCP setup and startup.
+- **`connection.rs`:** TCP accept loop and the per-connection I/O task (optional TLS handshake, read/write loop).
+- **`client.rs`:** Per-connection session that extracts frames from the read buffer and dispatches requests.
+- **`handlers.rs`:** One handler per TCP message type (`MET`, `TST`, `USR`, `UDP`, `MSG`, `GET`, `INS`, `DEL`); failures are turned into `ERR` replies in one place.
+- **`protocol.rs`:** Frame encoding and decoding shared by TCP and UDP.
+- **`state.rs`:** Shared state (clients, document, channels, metrics) and message broadcasting.
+- **`document.rs`:** The document model with insert, delete and line wrapping.
+- **`udp.rs`:** UDP hello and cursor handling, the periodic cursor snapshot, and the UDP tasks.
+- **`tls.rs`:** Loading of the TLS certificate and key.
 
 ## Protocol Specification
 
@@ -76,4 +90,4 @@ The current protocol version is **`komon-3`** and it is backwards compatible wit
 
 ## Development & Tooling
 
-Antigravity was used as an AI assistant in the development of the project, assisting with system architecture design, protocol implementation, client/server debugging, and automated test suite creation.
+Antigravity and Claude Code were used as AI assistants in the development of the project, assisting with system architecture design, protocol implementation, client/server debugging, and automated test suite creation.

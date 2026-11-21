@@ -1,109 +1,14 @@
-use std::{
-    collections::{HashMap, HashSet},
-    net::SocketAddr,
-    sync::{Arc, Mutex, MutexGuard},
+//! Per-connection TCP session: frame extraction and request dispatch.
+
+use std::net::SocketAddr;
+
+use tracing::warn;
+
+use crate::{
+    handlers::{Context, Request, dispatch},
+    protocol::HEADER_LEN,
+    state::{ClientId, State},
 };
-
-use serde::Serialize;
-use tokio::sync::mpsc::UnboundedSender;
-use tracing::{error, warn};
-
-use crate::document::Document;
-
-pub type ClientId = u64;
-
-#[derive(Debug, Default, Serialize)]
-pub struct ServerMetrics {
-    pub connections_total: u64,
-    pub messages_received: u64,
-    pub errors: u64,
-}
-
-/// Per-connection entry in the shared registry. Used by other connections to
-/// check username uniqueness and to broadcast messages.
-pub struct ClientHandle {
-    pub username: Option<String>,
-    /// Token announced over TCP with `UDP <token>`; a hello datagram carrying
-    /// it binds the datagram's real source address to this client.
-    pub udp_token: Option<String>,
-    /// UDP endpoint learned from the hello datagram (works through NAT); only
-    /// datagrams from exactly this address count as this client's cursor.
-    pub udp_addr: Option<SocketAddr>,
-    /// Last cursor position (line, col) reported over UDP.
-    pub cursor: Option<(usize, usize)>,
-    pub next_server_msg_id: u32,
-    /// Message IDs already in use on this connection: the ones the client has
-    /// sent in its requests plus the ones the server has allocated. IDs are
-    /// connection-specific, so a new server-originated ID must not be in here.
-    pub used_ids: HashSet<u32>,
-    /// Bytes pushed here are written to the client's socket by its own task.
-    pub tx: UnboundedSender<Vec<u8>>,
-}
-
-impl ClientHandle {
-    pub fn new(tx: UnboundedSender<Vec<u8>>) -> Self {
-        ClientHandle {
-            username: None,
-            udp_token: None,
-            udp_addr: None,
-            cursor: None,
-            next_server_msg_id: 2,
-            used_ids: HashSet::new(),
-            tx,
-        }
-    }
-
-    /// Allocates a message ID that is not yet used on this connection, and
-    /// marks it as used so it is never handed out twice.
-    ///
-    /// IDs are handed out in steps of two (2, 4, 6, ...) so that they rarely
-    /// meet the IDs of well-behaved clients that count 1, 3, 5, ..., but any
-    /// ID the client has actually used is skipped regardless of parity.
-    fn take_server_msg_id(&mut self) -> u32 {
-        // Terminates because only a finite number of IDs can have been used.
-        loop {
-            let id = self.next_server_msg_id;
-            self.next_server_msg_id = self.next_server_msg_id.wrapping_add(2);
-            if self.used_ids.insert(id) {
-                return id;
-            }
-        }
-    }
-}
-
-/// State shared between all connection tasks.
-pub struct State {
-    pub clients: HashMap<ClientId, ClientHandle>,
-    pub metrics: ServerMetrics,
-    pub document: Document,
-    pub channels: HashSet<String>,
-}
-
-impl Default for State {
-    fn default() -> Self {
-        let mut channels = HashSet::new();
-        channels.insert("general".to_string());
-        Self {
-            clients: HashMap::new(),
-            metrics: ServerMetrics::default(),
-            document: Document::default(),
-            channels,
-        }
-    }
-}
-
-/// Shared state handle. The lock is only ever held in synchronous code (never
-/// across an `.await`), so a std mutex is the right choice.
-#[derive(Clone, Default)]
-pub struct SharedState(Arc<Mutex<State>>);
-
-impl SharedState {
-    pub fn lock(&self) -> MutexGuard<'_, State> {
-        self.0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-}
 
 /// Connection-local state. The socket itself is owned by the connection task.
 pub struct Client {
@@ -125,571 +30,59 @@ impl Client {
         }
     }
 
+    /// Handles every complete frame in `read_buf`, appending replies to
+    /// `write_buf`. A malformed length closes the connection.
     pub fn process_messages(&mut self, state: &mut State) {
-        let State {
-            clients,
-            metrics,
-            document,
-            channels,
-        } = state;
-
-        loop {
-            if self.read_buf.len() < 4 {
-                break;
-            }
-            let len = u32::from_be_bytes(self.read_buf[..4].try_into().unwrap()) as usize;
-
-            if len < 12 {
-                warn!("Protocol error: message length too short");
-                self.is_closed = true;
-                break;
+        while let Some(msg_bytes) = self.take_frame() {
+            let id = u32::from_be_bytes(msg_bytes[4..8].try_into().unwrap());
+            state.metrics.messages_received += 1;
+            if let Some(me) = state.clients.get_mut(&self.id) {
+                me.used_ids.insert(id);
             }
 
-            if self.read_buf.len() < len {
-                break;
-            }
-
-            let msg_bytes = self.read_buf[..len].to_vec();
-            self.read_buf.drain(..len);
-
-            let msg_id = u32::from_be_bytes(msg_bytes[4..8].try_into().unwrap());
-            let msg_type = &msg_bytes[8..12];
-            let payload = &msg_bytes[12..];
-
-            metrics.messages_received += 1;
-            if let Some(me) = clients.get_mut(&self.id) {
-                me.used_ids.insert(msg_id);
-            }
-
-            match msg_type {
-                b"MET " => match serde_json::to_string(&*metrics) {
-                    Ok(metrics_json) => {
-                        self.write_buf.extend_from_slice(&frame(
-                            msg_id,
-                            b"MET ",
-                            metrics_json.as_bytes(),
-                        ));
-                    }
-                    Err(e) => {
-                        error!("Failed to serialize metrics: {}", e);
-                        metrics.errors += 1;
-                        self.write_buf.extend_from_slice(&create_error(
-                            msg_id,
-                            "Internal error serializing metrics",
-                        ));
-                    }
-                },
-                b"TST " => {
-                    self.write_buf.extend_from_slice(&msg_bytes);
-                }
-                b"USR " => {
-                    if let Ok(username_str) = std::str::from_utf8(payload) {
-                        let requested_usr = username_str.to_string();
-
-                        let is_taken = clients
-                            .values()
-                            .any(|c| c.username.as_ref() == Some(&requested_usr));
-
-                        if is_taken {
-                            self.write_buf.extend_from_slice(&create_error(
-                                msg_id,
-                                "Username already taken!",
-                            ));
-                            warn!("Username: {} already taken", username_str);
-                        } else {
-                            if let Some(me) = clients.get_mut(&self.id) {
-                                me.username = Some(requested_usr);
-                            }
-                            self.write_buf.extend_from_slice(&msg_bytes);
-                        }
-                    } else {
-                        self.write_buf
-                            .extend_from_slice(&create_error(msg_id, "Invalid UTF-8 in username"));
-                        warn!("Invalid UTF-8 in USR payload");
-                        metrics.errors += 1;
-                    }
-                }
-                b"MSG " => {
-                    let sender_usr = match clients.get(&self.id).and_then(|c| c.username.clone()) {
-                        Some(usr) => usr,
-                        None => {
-                            self.write_buf.extend_from_slice(&create_error(
-                                msg_id,
-                                "Not registered. Send USR first.",
-                            ));
-                            warn!("Tried to send MSG without username");
-                            metrics.errors += 1;
-                            continue;
-                        }
-                    };
-
-                    let payload_str = match std::str::from_utf8(payload) {
-                        Ok(s) => s,
-                        Err(err) => {
-                            warn!("Failed parsing of payload: {}", err);
-                            metrics.errors += 1;
-                            continue;
-                        }
-                    };
-
-                    if let Some((channel, message_text)) = payload_str.split_once(' ') {
-                        // If channel does not exist, create it dynamically
-                        if channels.insert(channel.to_string()) {
-                            tracing::info!("Created new channel: {}", channel);
-                        }
-
-                        // Format the broadcast: <Sender> <Channel> <Message>
-                        let broadcast_payload =
-                            format!("{} {} {}", sender_usr, channel, message_text);
-                        broadcast_to_all(
-                            clients,
-                            self.id,
-                            &mut self.write_buf,
-                            b"MSG ",
-                            broadcast_payload.as_bytes(),
-                        );
-                    } else {
-                        // Errors still use the client's `msg_id` as requested by the spec
-                        self.write_buf.extend_from_slice(&create_error(
-                            msg_id,
-                            "Invalid MSG syntax. Expected: <channel> <message>",
-                        ));
-                        warn!("MSG not according to protocol");
-                        metrics.errors += 1;
-                    }
-                }
-                b"UDP " => {
-                    let token = std::str::from_utf8(payload)
-                        .ok()
-                        .map(str::trim)
-                        .filter(|t| !t.is_empty() && t.len() <= 64 && !t.contains(' '));
-                    let registered = clients.get(&self.id).is_some_and(|c| c.username.is_some());
-                    match (registered, token) {
-                        (false, _) => {
-                            self.write_buf.extend_from_slice(&create_error(
-                                msg_id,
-                                "Not registered. Send USR first.",
-                            ));
-                            metrics.errors += 1;
-                        }
-                        (true, None) => {
-                            self.write_buf.extend_from_slice(&create_error(
-                                msg_id,
-                                "Invalid UDP syntax. Expected: <token>",
-                            ));
-                            metrics.errors += 1;
-                        }
-                        (true, Some(token)) => {
-                            if let Some(me) = clients.get_mut(&self.id) {
-                                me.udp_token = Some(token.to_string());
-                                me.udp_addr = None;
-                            }
-                            self.write_buf.extend_from_slice(&msg_bytes);
-                        }
-                    }
-                }
-                b"GET " => {
-                    let is_registered = clients.get(&self.id).is_some_and(|c| c.username.is_some());
-                    if !is_registered {
-                        self.write_buf.extend_from_slice(&create_error(
-                            msg_id,
-                            "Not registered. Send USR first.",
-                        ));
-                        warn!("Tried to GET document without username");
-                        metrics.errors += 1;
-                        continue;
-                    }
-
-                    let doc_payload = format!("{}\n{}", document.revision, document.text());
-                    self.write_buf.extend_from_slice(&frame(
-                        msg_id,
-                        b"GET ",
-                        doc_payload.as_bytes(),
-                    ));
-                }
-                b"INS " => {
-                    let is_registered = clients.get(&self.id).is_some_and(|c| c.username.is_some());
-                    if !is_registered {
-                        self.write_buf.extend_from_slice(&create_error(
-                            msg_id,
-                            "Not registered. Send USR first.",
-                        ));
-                        warn!("Tried to INS without username");
-                        metrics.errors += 1;
-                        continue;
-                    }
-
-                    let payload_str = match std::str::from_utf8(payload) {
-                        Ok(s) => s,
-                        Err(err) => {
-                            warn!("Failed parsing of INS payload: {}", err);
-                            metrics.errors += 1;
-                            self.write_buf.extend_from_slice(&create_error(
-                                msg_id,
-                                "Invalid UTF-8 in INS payload",
-                            ));
-                            continue;
-                        }
-                    };
-
-                    let (line_str, rest) = match payload_str.split_once(' ') {
-                        Some(pair) => pair,
-                        None => {
-                            self.write_buf.extend_from_slice(&create_error(
-                                msg_id,
-                                "Invalid INS syntax. Expected: <line> <col> <text>",
-                            ));
-                            warn!("INS invalid syntax");
-                            metrics.errors += 1;
-                            continue;
-                        }
-                    };
-
-                    let (col_str, text_to_insert) = match rest.split_once(' ') {
-                        Some(pair) => pair,
-                        None => (rest, ""),
-                    };
-
-                    let line: usize = match line_str.parse() {
-                        Ok(n) => n,
-                        Err(_) => {
-                            self.write_buf.extend_from_slice(&create_error(
-                                msg_id,
-                                "Invalid line number in INS",
-                            ));
-                            metrics.errors += 1;
-                            continue;
-                        }
-                    };
-
-                    let col: usize = match col_str.parse() {
-                        Ok(n) => n,
-                        Err(_) => {
-                            self.write_buf.extend_from_slice(&create_error(
-                                msg_id,
-                                "Invalid column number in INS",
-                            ));
-                            metrics.errors += 1;
-                            continue;
-                        }
-                    };
-
-                    match document.insert(line, col, text_to_insert) {
-                        Ok(()) => {
-                            // Echo back exact same message with request ID
-                            self.write_buf.extend_from_slice(&msg_bytes);
-
-                            // Broadcast updated document state to all registered clients
-                            let doc_payload = format!("{}\n{}", document.revision, document.text());
-                            broadcast_to_all(
-                                clients,
-                                self.id,
-                                &mut self.write_buf,
-                                b"GET ",
-                                doc_payload.as_bytes(),
-                            );
-                        }
-                        Err(err_msg) => {
-                            self.write_buf
-                                .extend_from_slice(&create_error(msg_id, err_msg));
-                            warn!("INS failed: {}", err_msg);
-                            metrics.errors += 1;
-                        }
-                    }
-                }
-                b"DEL " => {
-                    let is_registered = clients.get(&self.id).is_some_and(|c| c.username.is_some());
-                    if !is_registered {
-                        self.write_buf.extend_from_slice(&create_error(
-                            msg_id,
-                            "Not registered. Send USR first.",
-                        ));
-                        warn!("Tried to DEL without username");
-                        metrics.errors += 1;
-                        continue;
-                    }
-
-                    let payload_str = match std::str::from_utf8(payload) {
-                        Ok(s) => s,
-                        Err(err) => {
-                            warn!("Failed parsing of DEL payload: {}", err);
-                            metrics.errors += 1;
-                            self.write_buf.extend_from_slice(&create_error(
-                                msg_id,
-                                "Invalid UTF-8 in DEL payload",
-                            ));
-                            continue;
-                        }
-                    };
-
-                    let mut parts = payload_str.split_whitespace();
-                    let (line_str, col_str, count_str) =
-                        match (parts.next(), parts.next(), parts.next(), parts.next()) {
-                            (Some(l), Some(c), Some(cnt), None) => (l, c, cnt),
-                            _ => {
-                                self.write_buf.extend_from_slice(&create_error(
-                                    msg_id,
-                                    "Invalid DEL syntax. Expected: <line> <col> <count>",
-                                ));
-                                warn!("DEL invalid syntax");
-                                metrics.errors += 1;
-                                continue;
-                            }
-                        };
-
-                    let line: usize = match line_str.parse() {
-                        Ok(n) => n,
-                        Err(_) => {
-                            self.write_buf.extend_from_slice(&create_error(
-                                msg_id,
-                                "Invalid line number in DEL",
-                            ));
-                            metrics.errors += 1;
-                            continue;
-                        }
-                    };
-
-                    let col: usize = match col_str.parse() {
-                        Ok(n) => n,
-                        Err(_) => {
-                            self.write_buf.extend_from_slice(&create_error(
-                                msg_id,
-                                "Invalid column number in DEL",
-                            ));
-                            metrics.errors += 1;
-                            continue;
-                        }
-                    };
-
-                    let count: usize = match count_str.parse() {
-                        Ok(n) => n,
-                        Err(_) => {
-                            self.write_buf
-                                .extend_from_slice(&create_error(msg_id, "Invalid count in DEL"));
-                            metrics.errors += 1;
-                            continue;
-                        }
-                    };
-
-                    match document.delete(line, col, count) {
-                        Ok(()) => {
-                            // Echo back exact same message with request ID
-                            self.write_buf.extend_from_slice(&msg_bytes);
-
-                            // Broadcast updated document state to all registered clients
-                            let doc_payload = format!("{}\n{}", document.revision, document.text());
-                            broadcast_to_all(
-                                clients,
-                                self.id,
-                                &mut self.write_buf,
-                                b"GET ",
-                                doc_payload.as_bytes(),
-                            );
-                        }
-                        Err(err_msg) => {
-                            self.write_buf
-                                .extend_from_slice(&create_error(msg_id, err_msg));
-                            warn!("DEL failed: {}", err_msg);
-                            metrics.errors += 1;
-                        }
-                    }
-                }
-
-                _ => {
-                    self.write_buf
-                        .extend_from_slice(&create_error(msg_id, "Unknown message type"));
-                    warn!("Unknown message type");
-                    metrics.errors += 1;
-                }
-            }
+            let request = Request {
+                id,
+                msg_type: &msg_bytes[8..HEADER_LEN],
+                payload: &msg_bytes[HEADER_LEN..],
+                raw: &msg_bytes,
+            };
+            let mut ctx = Context {
+                client_id: self.id,
+                state,
+                out: &mut self.write_buf,
+            };
+            dispatch(&mut ctx, &request);
         }
     }
-}
 
-/// Handles one UDP datagram; anything invalid is dropped silently (UDP has no
-/// error channel). Two kinds are accepted:
-/// * `UDP <token>` hello: binds the datagram's source address to the client that
-///   announced the token over TCP, and is acknowledged with a `UDP ` datagram.
-///   Learning the address from the datagram itself makes this work through NAT.
-/// * `CUR <line> <col>` from a bound address: stored and relayed as
-///   `CUR <username> <line> <col>` to every other client with a bound endpoint.
-///
-/// Returns the datagrams to send.
-pub fn handle_udp_datagram(
-    state: &mut State,
-    src: SocketAddr,
-    data: &[u8],
-) -> Vec<(SocketAddr, Vec<u8>)> {
-    let State {
-        clients, metrics, ..
-    } = state;
-    metrics.messages_received += 1;
-
-    let header = (|| {
-        if data.len() < 12 || u32::from_be_bytes(data[..4].try_into().ok()?) as usize != data.len()
-        {
+    /// Removes and returns the next complete frame from `read_buf`, or `None`
+    /// if more bytes are needed (or the connection was closed for a bad length).
+    fn take_frame(&mut self) -> Option<Vec<u8>> {
+        if self.read_buf.len() < 4 {
             return None;
         }
-        let id = u32::from_be_bytes(data[4..8].try_into().ok()?);
-        Some((id, &data[8..12], std::str::from_utf8(&data[12..]).ok()?))
-    })();
-    let Some((msg_id, kind, text)) = header else {
-        metrics.errors += 1;
-        return Vec::new();
-    };
-
-    if kind == b"UDP " {
-        let token = text.trim();
-        let found = clients
-            .values_mut()
-            .find(|c| c.username.is_some() && c.udp_token.as_deref() == Some(token));
-        return match found {
-            Some(c) => {
-                if c.udp_addr != Some(src) {
-                    tracing::info!("UDP endpoint for {:?} is {src}", c.username);
-                }
-                c.udp_addr = Some(src);
-                vec![(src, frame(msg_id, b"UDP ", b""))]
-            }
-            None => {
-                metrics.errors += 1;
-                Vec::new()
-            }
-        };
-    }
-
-    let parsed = (|| {
-        if kind != b"CUR " {
+        let len = u32::from_be_bytes(self.read_buf[..4].try_into().unwrap()) as usize;
+        if len < HEADER_LEN {
+            warn!("Protocol error: message length too short");
+            self.is_closed = true;
             return None;
         }
-        let mut parts = text.split_whitespace();
-        let line: usize = parts.next()?.parse().ok()?;
-        let col: usize = parts.next()?.parse().ok()?;
-        if parts.next().is_some() || col > crate::document::MAX_COLUMNS {
+        if self.read_buf.len() < len {
             return None;
         }
-        Some((line, col))
-    })();
-
-    let Some((line, col)) = parsed else {
-        metrics.errors += 1;
-        return Vec::new();
-    };
-
-    let Some((sender_id, username)) = clients
-        .iter()
-        .find(|(_, c)| c.udp_addr == Some(src))
-        .and_then(|(id, c)| Some((*id, c.username.clone()?)))
-    else {
-        metrics.errors += 1;
-        return Vec::new();
-    };
-
-    if let Some(me) = clients.get_mut(&sender_id) {
-        me.cursor = Some((line, col));
+        Some(self.read_buf.drain(..len).collect())
     }
-
-    let payload = format!("{username} {line} {col}");
-    let mut out = Vec::new();
-    for (id, other) in clients.iter_mut() {
-        if *id == sender_id {
-            continue;
-        }
-        if let (Some(addr), Some(_)) = (other.udp_addr, &other.username) {
-            let msg_id = other.take_server_msg_id();
-            out.push((addr, frame(msg_id, b"CUR ", payload.as_bytes())));
-        }
-    }
-    out
-}
-
-/// Builds a snapshot of every known cursor for every client with a registered
-/// UDP endpoint (each recipient gets all cursors except its own). Sent
-/// periodically so late joiners and clients that lost datagrams catch up, and
-/// so clients can expire cursors of users that have left.
-pub fn cursor_snapshot(state: &mut State) -> Vec<(SocketAddr, Vec<u8>)> {
-    let cursors: Vec<(ClientId, String)> = state
-        .clients
-        .iter()
-        .filter_map(|(id, c)| {
-            let (line, col) = c.cursor?;
-            Some((*id, format!("{} {line} {col}", c.username.as_ref()?)))
-        })
-        .collect();
-
-    let mut out = Vec::new();
-    for (rid, recipient) in state.clients.iter_mut() {
-        let (Some(addr), Some(_)) = (recipient.udp_addr, &recipient.username) else {
-            continue;
-        };
-        for (cid, payload) in &cursors {
-            if cid != rid {
-                let msg_id = recipient.take_server_msg_id();
-                out.push((addr, frame(msg_id, b"CUR ", payload.as_bytes())));
-            }
-        }
-    }
-    out
-}
-
-/// Broadcasts a server-originated message to the sender and all other registered clients.
-fn broadcast_to_all(
-    clients: &mut HashMap<ClientId, ClientHandle>,
-    self_id: ClientId,
-    self_write_buf: &mut Vec<u8>,
-    msg_type: &[u8; 4],
-    payload: &[u8],
-) {
-    // 1. Send the broadcast to the sender using a SERVER allocated ID
-    if let Some(me) = clients.get_mut(&self_id) {
-        let sender_msg_id = me.take_server_msg_id();
-        self_write_buf.extend_from_slice(&frame(sender_msg_id, msg_type, payload));
-    }
-
-    // 2. Broadcast to all OTHER registered users; each one's task does the write
-    for (other_id, other) in clients.iter_mut() {
-        if *other_id == self_id || other.username.is_none() {
-            continue;
-        }
-        let other_msg_id = other.take_server_msg_id();
-        let other_msg = frame(other_msg_id, msg_type, payload);
-        let _ = other.tx.send(other_msg);
-    }
-}
-
-/// Builds a wire frame: `len (u32 BE) | id (u32 BE) | type (4 bytes) | payload`.
-fn frame(id: u32, msg_type: &[u8; 4], payload: &[u8]) -> Vec<u8> {
-    let len = (12 + payload.len()) as u32;
-    let mut out = Vec::with_capacity(len as usize);
-    out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(&id.to_be_bytes());
-    out.extend_from_slice(msg_type);
-    out.extend_from_slice(payload);
-    out
-}
-
-pub fn create_error(id: u32, error: &str) -> Vec<u8> {
-    frame(id, b"ERR ", error.as_bytes())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        protocol::{create_error, frame},
+        state::ClientHandle,
+        udp::{cursor_snapshot, handle_udp_datagram},
+    };
     use tokio::sync::mpsc;
-
-    #[test]
-    fn error_creation_working() {
-        let id = 12345;
-        let error_message = "Very serious error";
-        let error_vec: Vec<u8> = create_error(id, error_message);
-        let len = error_vec.len();
-        assert_eq!(
-            u32::from_be_bytes(error_vec[..4].try_into().unwrap()),
-            len as u32
-        );
-        assert_eq!(u32::from_be_bytes(error_vec[4..8].try_into().unwrap()), id);
-        assert_eq!(str::from_utf8(&error_vec[12..len]), Ok(error_message));
-    }
 
     fn addr() -> SocketAddr {
         "127.0.0.1:1".parse().unwrap()

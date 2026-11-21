@@ -38,7 +38,7 @@ struct Args {
     #[arg(short, long, default_value_t = MIN_CONNECTIONS)]
     connections: usize,
 
-    /// Protocol version to test (defaults to 'base-3'; use 'komon-2' to test document and multi-channel features)
+    /// Protocol version to test (defaults to 'base-3'; use 'komon-2' or 'komon-3' to test document and multi-channel features)
     #[arg(long, default_value = "base-3", env = "PROTOCOL")]
     protocol: String,
 
@@ -91,7 +91,7 @@ fn main() -> ExitCode {
     }
 
     let address = format!("{}:{}", args.addr, args.port);
-    let is_komon2 = args.protocol == "komon-2";
+    let is_komon2 = matches!(args.protocol.as_str(), "komon-2" | "komon-3");
 
     println!(
         "Opening {connections} concurrent connections to {address} (Protocol: {}, TLS: {})...",
@@ -260,17 +260,100 @@ fn connect(
     }
 }
 
+/// Everything a test phase needs to know about its connection.
+struct PhaseContext<'a> {
+    index: usize,
+    /// Index of the connection that sends the broadcast messages.
+    broadcaster: usize,
+    config: &'a ConnectionConfig,
+}
+
+impl PhaseContext<'_> {
+    fn username_of(&self, index: usize) -> String {
+        format!("{}{}", self.config.user_prefix, index)
+    }
+}
+
+type PhaseBody = fn(&PhaseContext, &mut ConnectionStream, &mut Report) -> io::Result<()>;
+
+/// A named test phase; `sync` makes all connections wait at the barrier after it.
+struct Phase {
+    name: &'static str,
+    body: PhaseBody,
+    sync: bool,
+}
+
+const BASE_PHASES: &[Phase] = &[
+    Phase {
+        name: "basic messages",
+        body: phase_basic_messages,
+        sync: false,
+    },
+    Phase {
+        name: "registration",
+        body: phase_registration,
+        sync: true,
+    },
+    Phase {
+        name: "error cases",
+        body: phase_error_cases,
+        sync: true,
+    },
+    Phase {
+        name: "broadcast",
+        body: phase_broadcast,
+        sync: true,
+    },
+    Phase {
+        name: "metrics",
+        body: phase_metrics,
+        sync: true,
+    },
+];
+
+/// Document and multi-channel phases (komon-2 and later).
+const DOCUMENT_PHASES: &[Phase] = &[
+    Phase {
+        name: "document GET",
+        body: phase_document_get,
+        sync: true,
+    },
+    Phase {
+        name: "document INS & broadcast",
+        body: phase_document_insert,
+        sync: true,
+    },
+    Phase {
+        name: "document DEL & broadcast",
+        body: phase_document_delete,
+        sync: true,
+    },
+    Phase {
+        name: "document bounds error",
+        body: phase_document_bounds_error,
+        sync: true,
+    },
+    Phase {
+        name: "multi-channel broadcast",
+        body: phase_multi_channel,
+        sync: true,
+    },
+];
+
 fn run_connection(index: usize, total: usize, config: &ConnectionConfig) -> Report {
     let start = Instant::now();
-    let username = format!("{}{}", config.user_prefix, index);
-    let first_username = format!("{}0", config.user_prefix);
     let mut report = Report {
         index,
-        username: username.clone(),
+        username: format!("{}{}", config.user_prefix, index),
         checks: Vec::new(),
         elapsed: Duration::ZERO,
         work: Duration::ZERO,
         waiting: Duration::ZERO,
+    };
+    let ctx = PhaseContext {
+        index,
+        broadcaster: total - 1,
+        config,
     };
 
     let connect_start = Instant::now();
@@ -283,338 +366,291 @@ fn run_connection(index: usize, total: usize, config: &ConnectionConfig) -> Repo
     };
     report.work += connect_start.elapsed();
 
-    let phase = |stream: &mut Option<ConnectionStream>,
-                 report: &mut Report,
-                 name: &str,
-                 body: &dyn Fn(&mut ConnectionStream, &mut Report) -> io::Result<()>,
-                 sync: bool| {
-        let work_start = Instant::now();
-        if let Some(s) = stream.as_mut()
-            && let Err(e) = body(s, report)
-        {
-            report.check(&format!("{name}: I/O error ({e})"), false);
-            *stream = None;
-        }
-        report.work += work_start.elapsed();
-
-        if sync {
-            let wait_start = Instant::now();
-            config.barrier.wait();
-            report.waiting += wait_start.elapsed();
-        }
+    let document_phases = if config.is_komon2 {
+        DOCUMENT_PHASES
+    } else {
+        &[]
     };
-
-    let broadcaster = total - 1;
-
-    // Phase 1: basic message handling
-    phase(
-        &mut stream,
-        &mut report,
-        "basic messages",
-        &|s, r| {
-            let tst = create_message(1, "TST ", "Testing");
-            s.write_all(&tst)?;
-            s.flush()?;
-            r.check("TST is echoed back", read_frame(s)? == tst);
-
-            s.write_all(&create_message(3, "BYE ", "Testing"))?;
-            s.flush()?;
-            let (_, id, ty, _) = decode_message(&read_frame(s)?);
-            r.check(
-                "unknown message type gets ERR with the same id",
-                ty == "ERR " && id == 3,
-            );
-
-            if index == 1 {
-                s.write_all(&create_message(5, "MSG ", "general too early"))?;
-                s.flush()?;
-                let (_, id, ty, _) = decode_message(&read_frame(s)?);
-                r.check(
-                    "MSG before USR gets ERR with the same id",
-                    ty == "ERR " && id == 5,
-                );
-            }
-            Ok(())
-        },
-        false,
-    );
-
-    // Phase 2: registration
-    phase(
-        &mut stream,
-        &mut report,
-        "registration",
-        &|s, r| {
-            let usr = create_message(7, "USR ", &username);
-            s.write_all(&usr)?;
-            s.flush()?;
-            r.check("USR is accepted and echoed", read_frame(s)? == usr);
-            Ok(())
-        },
-        true,
-    );
-
-    // Phase 3: error use cases
-    phase(
-        &mut stream,
-        &mut report,
-        "error cases",
-        &|s, r| {
-            if index == 2 {
-                s.write_all(&create_message(9, "USR ", &first_username))?;
-                s.flush()?;
-                let (_, id, ty, _) = decode_message(&read_frame(s)?);
-                r.check("duplicate username gets ERR", ty == "ERR " && id == 9);
-            }
-            if index == 3 {
-                s.write_all(&create_message(11, "MSG ", "malformed"))?;
-                s.flush()?;
-                let (_, id, ty, _) = decode_message(&read_frame(s)?);
-                r.check(
-                    "MSG without <channel> <text> gets ERR with the same id",
-                    ty == "ERR " && id == 11,
-                );
-            }
-            Ok(())
-        },
-        true,
-    );
-
-    // Phase 4: broadcast
-    let expected_payload = format!(
-        "{}{} general {}",
-        config.user_prefix, broadcaster, BROADCAST_TEXT
-    );
-    phase(
-        &mut stream,
-        &mut report,
-        "broadcast",
-        &|s, r| {
-            if index == broadcaster {
-                s.write_all(&create_message(
-                    13,
-                    "MSG ",
-                    &format!("general {BROADCAST_TEXT}"),
-                ))?;
-                s.flush()?;
-                let (len, id, ty, payload) = decode_message(&read_frame(s)?);
-                r.check(
-                    "MSG is echoed to the sender with a newly allocated server id",
-                    ty == "MSG "
-                        && !CLIENT_IDS.contains(&id)
-                        && payload == expected_payload
-                        && len as usize == 12 + payload.len(),
-                );
-            } else {
-                let (_, id, ty, payload) = decode_message(&read_frame(s)?);
-                r.check(
-                    "broadcast MSG from another user received",
-                    ty == "MSG " && !CLIENT_IDS.contains(&id) && payload == expected_payload,
-                );
-            }
-            Ok(())
-        },
-        true,
-    );
-
-    // Phase 5: metrics
-    phase(
-        &mut stream,
-        &mut report,
-        "metrics",
-        &|s, r| {
-            if index == 0 {
-                s.write_all(&create_message(15, "MET ", ""))?;
-                s.flush()?;
-                let (_, id, ty, payload) = decode_message(&read_frame(s)?);
-                r.check(
-                    "MET returns the metrics JSON",
-                    ty == "MET "
-                        && id == 15
-                        && payload.contains("\"connections_total\"")
-                        && payload.contains("\"messages_received\""),
-                );
-            }
-            Ok(())
-        },
-        true,
-    );
-
-    // Document & Multi-Channel Protocol Testing (komon-2 only)
-    if config.is_komon2 {
-        // Phase 6: GET document
-        phase(
-            &mut stream,
-            &mut report,
-            "document GET",
-            &|s, r| {
-                if index == 0 {
-                    s.write_all(&create_message(17, "GET ", ""))?;
-                    s.flush()?;
-                    let (_, id, ty, payload) = decode_message(&read_frame(s)?);
-                    let valid_get = ty == "GET " && id == 17 && payload.contains('\n');
-                    r.check(
-                        "GET returns document status (<revision>\\n<content>)",
-                        valid_get,
-                    );
-                }
-                Ok(())
-            },
-            true,
-        );
-
-        // Phase 7: INS document and broadcast
-        phase(
-            &mut stream,
-            &mut report,
-            "document INS & broadcast",
-            &|s, r| {
-                if index == 0 {
-                    s.write_all(&create_message(19, "INS ", "0 0 Collaborative"))?;
-                    s.flush()?;
-                    // 1) Echo of INS with request ID 19
-                    let ins_frame = read_frame(s)?;
-                    let (_, ins_id, ins_ty, _) = decode_message(&ins_frame);
-                    r.check(
-                        "INS echoed with request ID",
-                        ins_ty == "INS " && ins_id == 19,
-                    );
-
-                    // 2) Broadcast GET with server-allocated ID
-                    let get_frame = read_frame(s)?;
-                    let (_, get_id, get_ty, payload) = decode_message(&get_frame);
-                    r.check(
-                        "INS triggers GET broadcast to sender with server ID",
-                        get_ty == "GET "
-                            && !CLIENT_IDS.contains(&get_id)
-                            && payload.contains("Collaborative"),
-                    );
-                } else {
-                    // Other clients receive GET broadcast with their server ID
-                    let get_frame = read_frame(s)?;
-                    let (_, get_id, get_ty, payload) = decode_message(&get_frame);
-                    r.check(
-                        "peers receive GET broadcast after INS",
-                        get_ty == "GET "
-                            && !CLIENT_IDS.contains(&get_id)
-                            && payload.contains("Collaborative"),
-                    );
-                }
-                Ok(())
-            },
-            true,
-        );
-
-        // Phase 8: DEL document and broadcast
-        phase(
-            &mut stream,
-            &mut report,
-            "document DEL & broadcast",
-            &|s, r| {
-                if index == 0 {
-                    s.write_all(&create_message(21, "DEL ", "0 0 5"))?;
-                    s.flush()?;
-                    // 1) Echo of DEL with request ID 21
-                    let del_frame = read_frame(s)?;
-                    let (_, del_id, del_ty, _) = decode_message(&del_frame);
-                    r.check(
-                        "DEL echoed with request ID",
-                        del_ty == "DEL " && del_id == 21,
-                    );
-
-                    // 2) Broadcast GET with server-allocated ID
-                    let get_frame = read_frame(s)?;
-                    let (_, get_id, get_ty, payload) = decode_message(&get_frame);
-                    r.check(
-                        "DEL triggers GET broadcast to sender with server ID",
-                        get_ty == "GET "
-                            && !CLIENT_IDS.contains(&get_id)
-                            && payload.contains("borative"),
-                    );
-                } else {
-                    // Other clients receive GET broadcast with their server ID
-                    let get_frame = read_frame(s)?;
-                    let (_, get_id, get_ty, payload) = decode_message(&get_frame);
-                    r.check(
-                        "peers receive GET broadcast after DEL",
-                        get_ty == "GET "
-                            && !CLIENT_IDS.contains(&get_id)
-                            && payload.contains("borative"),
-                    );
-                }
-                Ok(())
-            },
-            true,
-        );
-
-        // Phase 9: Document error cases (exceeding MAX_COLUMNS)
-        phase(
-            &mut stream,
-            &mut report,
-            "document bounds error",
-            &|s, r| {
-                if index == 1 {
-                    s.write_all(&create_message(23, "INS ", "0 85 out_of_bounds"))?;
-                    s.flush()?;
-                    let (_, id, ty, _) = decode_message(&read_frame(s)?);
-                    r.check(
-                        "INS beyond max columns returns ERR with same ID",
-                        ty == "ERR " && id == 23,
-                    );
-                }
-                Ok(())
-            },
-            true,
-        );
-
-        // Phase 10: Multi-channel dynamic creation and broadcasting
-        phase(
-            &mut stream,
-            &mut report,
-            "multi-channel broadcast",
-            &|s, r| {
-                let channel_name = "project-updates";
-                let msg_text = "Welcome to the new channel!";
-
-                if index == 0 {
-                    // Connection 0 sends a message to an unrecognized channel name
-                    s.write_all(&create_message(
-                        25,
-                        "MSG ",
-                        &format!("{channel_name} {msg_text}"),
-                    ))?;
-                    s.flush()?;
-                    let (len, id, ty, payload) = decode_message(&read_frame(s)?);
-                    let expected_echo =
-                        format!("{}0 {channel_name} {msg_text}", config.user_prefix);
-                    r.check(
-                        "MSG to new channel dynamically creates channel and echoes to sender",
-                        ty == "MSG "
-                            && !CLIENT_IDS.contains(&id)
-                            && payload == expected_echo
-                            && len as usize == 12 + payload.len(),
-                    );
-                } else {
-                    // Other connections receive the broadcast on the dynamically created channel
-                    let (len, id, ty, payload) = decode_message(&read_frame(s)?);
-                    let expected_broadcast =
-                        format!("{}0 {channel_name} {msg_text}", config.user_prefix);
-                    r.check(
-                        "peers receive broadcast from dynamically created channel",
-                        ty == "MSG "
-                            && !CLIENT_IDS.contains(&id)
-                            && payload == expected_broadcast
-                            && len as usize == 12 + payload.len(),
-                    );
-                }
-                Ok(())
-            },
-            true,
-        );
+    for phase in BASE_PHASES.iter().chain(document_phases) {
+        run_phase(&ctx, phase, &mut stream, &mut report);
     }
 
     report.elapsed = start.elapsed();
     report
+}
+
+/// Runs one phase, records its time, and drops the stream after an I/O error.
+fn run_phase(
+    ctx: &PhaseContext,
+    phase: &Phase,
+    stream: &mut Option<ConnectionStream>,
+    report: &mut Report,
+) {
+    let work_start = Instant::now();
+    if let Some(s) = stream.as_mut()
+        && let Err(e) = (phase.body)(ctx, s, report)
+    {
+        report.check(&format!("{}: I/O error ({e})", phase.name), false);
+        *stream = None;
+    }
+    report.work += work_start.elapsed();
+
+    if phase.sync {
+        let wait_start = Instant::now();
+        ctx.config.barrier.wait();
+        report.waiting += wait_start.elapsed();
+    }
+}
+
+/// Sends one message and returns the next frame decoded as (len, id, type, payload).
+fn request(
+    s: &mut ConnectionStream,
+    id: u32,
+    msg_type: &str,
+    payload: &str,
+) -> io::Result<(u32, u32, String, String)> {
+    send(s, id, msg_type, payload)?;
+    Ok(decode_message(&read_frame(s)?))
+}
+
+fn send(s: &mut ConnectionStream, id: u32, msg_type: &str, payload: &str) -> io::Result<()> {
+    s.write_all(&create_message(id, msg_type, payload))?;
+    s.flush()
+}
+
+fn next_message(s: &mut ConnectionStream) -> io::Result<(u32, u32, String, String)> {
+    Ok(decode_message(&read_frame(s)?))
+}
+
+fn phase_basic_messages(
+    ctx: &PhaseContext,
+    s: &mut ConnectionStream,
+    r: &mut Report,
+) -> io::Result<()> {
+    let tst = create_message(1, "TST ", "Testing");
+    s.write_all(&tst)?;
+    s.flush()?;
+    r.check("TST is echoed back", read_frame(s)? == tst);
+
+    let (_, id, ty, _) = request(s, 3, "BYE ", "Testing")?;
+    r.check(
+        "unknown message type gets ERR with the same id",
+        ty == "ERR " && id == 3,
+    );
+
+    if ctx.index == 1 {
+        let (_, id, ty, _) = request(s, 5, "MSG ", "general too early")?;
+        r.check(
+            "MSG before USR gets ERR with the same id",
+            ty == "ERR " && id == 5,
+        );
+    }
+    Ok(())
+}
+
+fn phase_registration(
+    ctx: &PhaseContext,
+    s: &mut ConnectionStream,
+    r: &mut Report,
+) -> io::Result<()> {
+    let usr = create_message(7, "USR ", &ctx.username_of(ctx.index));
+    s.write_all(&usr)?;
+    s.flush()?;
+    r.check("USR is accepted and echoed", read_frame(s)? == usr);
+    Ok(())
+}
+
+fn phase_error_cases(
+    ctx: &PhaseContext,
+    s: &mut ConnectionStream,
+    r: &mut Report,
+) -> io::Result<()> {
+    if ctx.index == 2 {
+        let (_, id, ty, _) = request(s, 9, "USR ", &ctx.username_of(0))?;
+        r.check("duplicate username gets ERR", ty == "ERR " && id == 9);
+    }
+    if ctx.index == 3 {
+        let (_, id, ty, _) = request(s, 11, "MSG ", "malformed")?;
+        r.check(
+            "MSG without <channel> <text> gets ERR with the same id",
+            ty == "ERR " && id == 11,
+        );
+    }
+    Ok(())
+}
+
+fn phase_broadcast(ctx: &PhaseContext, s: &mut ConnectionStream, r: &mut Report) -> io::Result<()> {
+    let expected_payload = format!(
+        "{} general {}",
+        ctx.username_of(ctx.broadcaster),
+        BROADCAST_TEXT
+    );
+    if ctx.index == ctx.broadcaster {
+        let (len, id, ty, payload) = request(s, 13, "MSG ", &format!("general {BROADCAST_TEXT}"))?;
+        r.check(
+            "MSG is echoed to the sender with a newly allocated server id",
+            ty == "MSG "
+                && !CLIENT_IDS.contains(&id)
+                && payload == expected_payload
+                && len as usize == 12 + payload.len(),
+        );
+    } else {
+        let (_, id, ty, payload) = next_message(s)?;
+        r.check(
+            "broadcast MSG from another user received",
+            ty == "MSG " && !CLIENT_IDS.contains(&id) && payload == expected_payload,
+        );
+    }
+    Ok(())
+}
+
+fn phase_metrics(ctx: &PhaseContext, s: &mut ConnectionStream, r: &mut Report) -> io::Result<()> {
+    if ctx.index == 0 {
+        let (_, id, ty, payload) = request(s, 15, "MET ", "")?;
+        r.check(
+            "MET returns the metrics JSON",
+            ty == "MET "
+                && id == 15
+                && payload.contains("\"connections_total\"")
+                && payload.contains("\"messages_received\""),
+        );
+    }
+    Ok(())
+}
+
+fn phase_document_get(
+    ctx: &PhaseContext,
+    s: &mut ConnectionStream,
+    r: &mut Report,
+) -> io::Result<()> {
+    if ctx.index == 0 {
+        let (_, id, ty, payload) = request(s, 17, "GET ", "")?;
+        r.check(
+            "GET returns document status (<revision>\\n<content>)",
+            ty == "GET " && id == 17 && payload.contains('\n'),
+        );
+    }
+    Ok(())
+}
+
+/// Shared by the INS and DEL phases: the editing connection gets the echo of its
+/// request followed by a GET broadcast; every other connection gets the broadcast.
+struct EditExpectation {
+    request_id: u32,
+    request_type: &'static str,
+    request_payload: &'static str,
+    expected_text: &'static str,
+    echo_check: &'static str,
+    sender_broadcast_check: &'static str,
+    peer_broadcast_check: &'static str,
+}
+
+fn run_edit_phase(
+    ctx: &PhaseContext,
+    s: &mut ConnectionStream,
+    r: &mut Report,
+    e: &EditExpectation,
+) -> io::Result<()> {
+    let broadcast_ok = |(_, id, ty, payload): (u32, u32, String, String)| {
+        ty == "GET " && !CLIENT_IDS.contains(&id) && payload.contains(e.expected_text)
+    };
+
+    if ctx.index == 0 {
+        let (_, id, ty, _) = request(s, e.request_id, e.request_type, e.request_payload)?;
+        r.check(e.echo_check, ty == e.request_type && id == e.request_id);
+        r.check(e.sender_broadcast_check, broadcast_ok(next_message(s)?));
+    } else {
+        r.check(e.peer_broadcast_check, broadcast_ok(next_message(s)?));
+    }
+    Ok(())
+}
+
+fn phase_document_insert(
+    ctx: &PhaseContext,
+    s: &mut ConnectionStream,
+    r: &mut Report,
+) -> io::Result<()> {
+    run_edit_phase(
+        ctx,
+        s,
+        r,
+        &EditExpectation {
+            request_id: 19,
+            request_type: "INS ",
+            request_payload: "0 0 Collaborative",
+            expected_text: "Collaborative",
+            echo_check: "INS echoed with request ID",
+            sender_broadcast_check: "INS triggers GET broadcast to sender with server ID",
+            peer_broadcast_check: "peers receive GET broadcast after INS",
+        },
+    )
+}
+
+fn phase_document_delete(
+    ctx: &PhaseContext,
+    s: &mut ConnectionStream,
+    r: &mut Report,
+) -> io::Result<()> {
+    run_edit_phase(
+        ctx,
+        s,
+        r,
+        &EditExpectation {
+            request_id: 21,
+            request_type: "DEL ",
+            request_payload: "0 0 5",
+            expected_text: "borative",
+            echo_check: "DEL echoed with request ID",
+            sender_broadcast_check: "DEL triggers GET broadcast to sender with server ID",
+            peer_broadcast_check: "peers receive GET broadcast after DEL",
+        },
+    )
+}
+
+fn phase_document_bounds_error(
+    ctx: &PhaseContext,
+    s: &mut ConnectionStream,
+    r: &mut Report,
+) -> io::Result<()> {
+    if ctx.index == 1 {
+        let (_, id, ty, _) = request(s, 23, "INS ", "0 85 out_of_bounds")?;
+        r.check(
+            "INS beyond max columns returns ERR with same ID",
+            ty == "ERR " && id == 23,
+        );
+    }
+    Ok(())
+}
+
+/// Connection 0 posts to a not-yet-existing channel; the server creates it and
+/// broadcasts to everyone.
+fn phase_multi_channel(
+    ctx: &PhaseContext,
+    s: &mut ConnectionStream,
+    r: &mut Report,
+) -> io::Result<()> {
+    let channel_name = "project-updates";
+    let msg_text = "Welcome to the new channel!";
+    let expected = format!("{} {channel_name} {msg_text}", ctx.username_of(0));
+
+    let (len, id, ty, payload) = if ctx.index == 0 {
+        request(s, 25, "MSG ", &format!("{channel_name} {msg_text}"))?
+    } else {
+        next_message(s)?
+    };
+    let description = if ctx.index == 0 {
+        "MSG to new channel dynamically creates channel and echoes to sender"
+    } else {
+        "peers receive broadcast from dynamically created channel"
+    };
+    r.check(
+        description,
+        ty == "MSG "
+            && !CLIENT_IDS.contains(&id)
+            && payload == expected
+            && len as usize == 12 + payload.len(),
+    );
+    Ok(())
 }
 
 fn read_frame<R: Read>(stream: &mut R) -> io::Result<Vec<u8>> {
