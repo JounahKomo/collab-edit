@@ -4,6 +4,10 @@
 /// Size of the fixed frame header (length, message id and message type).
 pub const HEADER_LEN: usize = 12;
 
+/// Largest frame (header included) the server accepts. Real requests are tiny;
+/// the limit stops a client from making the server buffer gigabytes.
+pub const MAX_FRAME_LEN: usize = 64 * 1024;
+
 /// Builds a wire frame.
 pub fn frame(id: u32, msg_type: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     let len = (HEADER_LEN + payload.len()) as u32;

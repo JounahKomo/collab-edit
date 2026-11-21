@@ -6,7 +6,7 @@ use tracing::warn;
 
 use crate::{
     handlers::{Context, Request, dispatch},
-    protocol::HEADER_LEN,
+    protocol::{HEADER_LEN, MAX_FRAME_LEN},
     state::{ClientId, State},
 };
 
@@ -34,7 +34,7 @@ impl Client {
     /// `write_buf`. A malformed length closes the connection.
     pub fn process_messages(&mut self, state: &mut State) {
         while let Some(msg_bytes) = self.take_frame() {
-            let id = u32::from_be_bytes(msg_bytes[4..8].try_into().unwrap());
+            let id = u32::from_be_bytes([msg_bytes[4], msg_bytes[5], msg_bytes[6], msg_bytes[7]]);
             state.metrics.messages_received += 1;
             if let Some(me) = state.clients.get_mut(&self.id) {
                 me.used_ids.insert(id);
@@ -61,10 +61,19 @@ impl Client {
         if self.read_buf.len() < 4 {
             return None;
         }
-        let len = u32::from_be_bytes(self.read_buf[..4].try_into().unwrap()) as usize;
-        if len < HEADER_LEN {
-            warn!("Protocol error: message length too short");
+        let len = u32::from_be_bytes([
+            self.read_buf[0],
+            self.read_buf[1],
+            self.read_buf[2],
+            self.read_buf[3],
+        ]) as usize;
+        if !(HEADER_LEN..=MAX_FRAME_LEN).contains(&len) {
+            warn!(
+                client = self.id,
+                "Protocol error: invalid frame length {len} (allowed {HEADER_LEN}..={MAX_FRAME_LEN}); closing connection"
+            );
             self.is_closed = true;
+            self.read_buf.clear();
             return None;
         }
         if self.read_buf.len() < len {
@@ -89,10 +98,45 @@ mod tests {
     }
 
     #[test]
+    fn oversized_or_short_frame_length_closes_the_connection() {
+        let mut state = State::default();
+        let (tx, _rx) = mpsc::channel(16);
+        state.clients.insert(1, ClientHandle::new(tx));
+
+        let mut huge = Client::new(1, addr());
+        huge.read_buf
+            .extend_from_slice(&(MAX_FRAME_LEN as u32 + 1).to_be_bytes());
+        huge.process_messages(&mut state);
+        assert!(huge.is_closed);
+        assert!(huge.read_buf.is_empty());
+
+        let mut short = Client::new(1, addr());
+        short.read_buf.extend_from_slice(&5u32.to_be_bytes());
+        short.process_messages(&mut state);
+        assert!(short.is_closed);
+    }
+
+    #[test]
+    fn partial_frames_are_buffered_until_complete() {
+        let mut state = State::default();
+        let (tx, _rx) = mpsc::channel(16);
+        state.clients.insert(1, ClientHandle::new(tx));
+        let mut a = Client::new(1, addr());
+
+        let tst = frame(1, b"TST ", b"hello");
+        a.read_buf.extend_from_slice(&tst[..7]);
+        a.process_messages(&mut state);
+        assert!(a.write_buf.is_empty() && !a.is_closed);
+        a.read_buf.extend_from_slice(&tst[7..]);
+        a.process_messages(&mut state);
+        assert_eq!(a.write_buf, tst);
+    }
+
+    #[test]
     fn dynamic_channel_creation() {
         let mut state = State::default();
-        let (tx_a, _rx_a) = mpsc::unbounded_channel();
-        let (tx_b, mut rx_b) = mpsc::unbounded_channel();
+        let (tx_a, _rx_a) = mpsc::channel(16);
+        let (tx_b, mut rx_b) = mpsc::channel(16);
         state.clients.insert(1, ClientHandle::new(tx_a));
         state.clients.insert(2, ClientHandle::new(tx_b));
 
@@ -129,8 +173,8 @@ mod tests {
     #[test]
     fn broadcast_reaches_other_registered_clients() {
         let mut state = State::default();
-        let (tx_a, _rx_a) = mpsc::unbounded_channel();
-        let (tx_b, mut rx_b) = mpsc::unbounded_channel();
+        let (tx_a, _rx_a) = mpsc::channel(16);
+        let (tx_b, mut rx_b) = mpsc::channel(16);
         state.clients.insert(1, ClientHandle::new(tx_a));
         state.clients.insert(2, ClientHandle::new(tx_b));
 
@@ -159,8 +203,8 @@ mod tests {
     #[test]
     fn udp_cur_relayed_to_other_registered_endpoints() {
         let mut state = State::default();
-        let (tx_a, _rx_a) = mpsc::unbounded_channel();
-        let (tx_b, _rx_b) = mpsc::unbounded_channel();
+        let (tx_a, _rx_a) = mpsc::channel(16);
+        let (tx_b, _rx_b) = mpsc::channel(16);
         state.clients.insert(1, ClientHandle::new(tx_a));
         state.clients.insert(2, ClientHandle::new(tx_b));
         let mut a = Client::new(1, "10.0.0.1:1000".parse().unwrap());
@@ -201,7 +245,7 @@ mod tests {
     #[test]
     fn server_ids_skip_ids_used_by_the_client() {
         let mut state = State::default();
-        let (tx_a, _rx_a) = mpsc::unbounded_channel();
+        let (tx_a, _rx_a) = mpsc::channel(16);
         state.clients.insert(1, ClientHandle::new(tx_a));
         let mut a = Client::new(1, addr());
 
@@ -225,8 +269,8 @@ mod tests {
     #[test]
     fn duplicate_username_rejected() {
         let mut state = State::default();
-        let (tx_a, _rx_a) = mpsc::unbounded_channel();
-        let (tx_b, _rx_b) = mpsc::unbounded_channel();
+        let (tx_a, _rx_a) = mpsc::channel(16);
+        let (tx_b, _rx_b) = mpsc::channel(16);
         state.clients.insert(1, ClientHandle::new(tx_a));
         state.clients.insert(2, ClientHandle::new(tx_b));
         let mut a = Client::new(1, addr());
@@ -243,8 +287,8 @@ mod tests {
     #[test]
     fn get_ins_del_flow_and_broadcast() {
         let mut state = State::default();
-        let (tx_a, _rx_a) = mpsc::unbounded_channel();
-        let (tx_b, mut rx_b) = mpsc::unbounded_channel();
+        let (tx_a, _rx_a) = mpsc::channel(16);
+        let (tx_b, mut rx_b) = mpsc::channel(16);
         state.clients.insert(1, ClientHandle::new(tx_a));
         state.clients.insert(2, ClientHandle::new(tx_b));
 
@@ -301,7 +345,7 @@ mod tests {
     #[test]
     fn ins_and_del_error_handling() {
         let mut state = State::default();
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(16);
         state.clients.insert(1, ClientHandle::new(tx));
         let mut a = Client::new(1, addr());
 

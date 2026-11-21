@@ -6,14 +6,21 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::mpsc,
+    time::{sleep, timeout},
 };
 use tokio_rustls::TlsAcceptor;
-use tracing::{error, info, warn};
+use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::{
     client::Client,
-    state::{ClientHandle, ClientId, SharedState},
+    state::{ClientHandle, ClientId, OUTBOX_CAPACITY, SharedState},
 };
+
+/// A TLS handshake must finish within this time.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// A connection must register with `USR` within this time, or it is closed.
+/// (Registered clients may stay idle; only anonymous connections are limited.)
+const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Accepts connections forever, spawning one task per client.
 pub async fn run_accept_loop(
@@ -25,22 +32,20 @@ pub async fn run_accept_loop(
     loop {
         match listener.accept().await {
             Ok((socket, peer)) => {
-                info!("Accepted TCP connection from: {}", peer);
                 let id = next_client_id;
                 next_client_id += 1;
                 state.lock().metrics.connections_total += 1;
-                tokio::spawn(serve_socket(
-                    socket,
-                    peer,
-                    id,
-                    acceptor.clone(),
-                    state.clone(),
-                ));
+                let span = info_span!("conn", id, %peer);
+                info!(parent: &span, "Accepted TCP connection");
+                tokio::spawn(
+                    serve_socket(socket, peer, id, acceptor.clone(), state.clone())
+                        .instrument(span),
+                );
             }
             Err(e) => {
                 error!("Error accepting connection: {e}");
                 state.lock().metrics.errors += 1;
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                sleep(Duration::from_millis(100)).await;
             }
         }
     }
@@ -55,14 +60,18 @@ async fn serve_socket(
     state: SharedState,
 ) {
     if let Err(e) = socket.set_nodelay(true) {
-        warn!("Failed to set TCP_NODELAY for {peer}: {e}");
+        warn!("Failed to set TCP_NODELAY: {e}");
     }
 
     match acceptor {
-        Some(acceptor) => match acceptor.accept(socket).await {
-            Ok(tls_stream) => handle_connection(tls_stream, peer, id, state).await,
-            Err(e) => {
-                warn!("TLS handshake failed with {peer}: {e}");
+        Some(acceptor) => match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(socket)).await {
+            Ok(Ok(tls_stream)) => handle_connection(tls_stream, peer, id, state).await,
+            Ok(Err(e)) => {
+                warn!("TLS handshake failed: {e}");
+                state.lock().metrics.errors += 1;
+            }
+            Err(_) => {
+                warn!("TLS handshake timed out");
                 state.lock().metrics.errors += 1;
             }
         },
@@ -70,38 +79,70 @@ async fn serve_socket(
     }
 }
 
+/// Removes the client from the shared registry when dropped, so the entry is
+/// released on every exit path, including a panic while handling a request.
+struct Registration {
+    id: ClientId,
+    state: SharedState,
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        self.state.lock().clients.remove(&self.id);
+    }
+}
+
 async fn handle_connection<S>(mut stream: S, address: SocketAddr, id: ClientId, state: SharedState)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(OUTBOX_CAPACITY);
     state.lock().clients.insert(id, ClientHandle::new(tx));
+    let _registration = Registration {
+        id,
+        state: state.clone(),
+    };
 
     let mut client = Client::new(id, address);
+    let registration_deadline = sleep(REGISTRATION_TIMEOUT);
+    tokio::pin!(registration_deadline);
+    let mut registered = false;
 
-    loop {
+    while !client.is_closed {
         tokio::select! {
             res = stream.read_buf(&mut client.read_buf) => match res {
-                Ok(0) => client.is_closed = true,
+                Ok(0) => {
+                    debug!("Peer closed the connection");
+                    client.is_closed = true;
+                }
                 Ok(_) => client.process_messages(&mut state.lock()),
                 Err(err) => {
                     client.is_closed = true;
-                    warn!("Failed reading from client {}: {}", client.address, err);
+                    warn!("Failed reading from client: {err}");
                     state.lock().metrics.errors += 1;
                 }
             },
             Some(msg) = rx.recv() => client.write_buf.extend_from_slice(&msg),
+            () = &mut registration_deadline, if !registered => {
+                warn!("Closing connection that did not register in time");
+                state.lock().metrics.errors += 1;
+                client.is_closed = true;
+            }
         }
 
+        registered = registered || is_registered(&state, id);
         flush_write_buffer(&mut stream, &mut client, &state).await;
-
-        if client.is_closed {
-            break;
-        }
     }
 
-    state.lock().clients.remove(&id);
-    info!("Connection closed: {}", client.address);
+    info!("Connection closed");
+}
+
+fn is_registered(state: &SharedState, id: ClientId) -> bool {
+    state
+        .lock()
+        .clients
+        .get(&id)
+        .is_some_and(|c| c.username.is_some())
 }
 
 /// Writes any queued output to the socket, closing the client on failure.
@@ -114,7 +155,7 @@ where
     }
     if let Err(err) = stream.write_all(&client.write_buf).await {
         client.is_closed = true;
-        warn!("Failed writing to client {}: {}", client.address, err);
+        warn!("Failed writing to client: {err}");
         state.lock().metrics.errors += 1;
     }
     client.write_buf.clear();

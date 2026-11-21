@@ -1,7 +1,7 @@
 //! One handler per TCP message type. Handlers return `Err(reason)` to have the
 //! dispatcher answer with an `ERR ` frame and count the error.
 
-use tracing::{error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::{
     protocol::{create_error, frame},
@@ -34,6 +34,13 @@ const MAX_TOKEN_LEN: usize = 64;
 /// Runs the handler for the request's message type and turns a failure into an
 /// `ERR ` reply that carries the request's ID.
 pub fn dispatch(ctx: &mut Context, req: &Request) {
+    debug!(
+        client = ctx.client_id,
+        id = req.id,
+        msg_type = %String::from_utf8_lossy(req.msg_type),
+        payload_len = req.payload.len(),
+        "Handling request"
+    );
     let result = match req.msg_type {
         b"MET " => handle_met(ctx, req),
         b"TST " => handle_tst(ctx, req),
@@ -47,7 +54,12 @@ pub fn dispatch(ctx: &mut Context, req: &Request) {
     };
 
     if let Err(reason) = result {
-        warn!("Request {} failed: {reason}", req.id);
+        // A client mistake, not a server fault: debug level keeps logs quiet under load.
+        debug!(
+            client = ctx.client_id,
+            id = req.id,
+            "Request rejected: {reason}"
+        );
         ctx.state.metrics.errors += 1;
         ctx.out.extend_from_slice(&create_error(req.id, &reason));
     }
@@ -84,7 +96,7 @@ fn document_payload(state: &State) -> String {
 
 fn payload_str<'a>(req: &'a Request, name: &str) -> Result<&'a str, String> {
     std::str::from_utf8(req.payload).map_err(|e| {
-        warn!("Failed parsing of {name} payload: {e}");
+        debug!("Invalid UTF-8 in {name} payload: {e}");
         format!("Invalid UTF-8 in {name} payload")
     })
 }
@@ -123,6 +135,7 @@ fn handle_usr(ctx: &mut Context, req: &Request) -> HandlerResult {
         return Err("Username already taken!".to_string());
     }
 
+    info!(client = ctx.client_id, username = %requested, "User registered");
     if let Some(me) = ctx.state.clients.get_mut(&ctx.client_id) {
         me.username = Some(requested);
     }

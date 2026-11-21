@@ -7,11 +7,18 @@ use std::{
 };
 
 use serde::Serialize;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
+use tracing::debug;
 
 use crate::{document::Document, protocol::frame};
 
 pub type ClientId = u64;
+
+/// How many broadcast frames may be queued for one client. A client that stops
+/// reading would otherwise make the server buffer without bound; once its queue
+/// is full further broadcasts to it are dropped (document snapshots are full
+/// state, so the next one repairs the loss).
+pub const OUTBOX_CAPACITY: usize = 256;
 
 #[derive(Debug, Default, Serialize)]
 pub struct ServerMetrics {
@@ -38,11 +45,11 @@ pub struct ClientHandle {
     /// connection-specific, so a new server-originated ID must not be in here.
     pub used_ids: HashSet<u32>,
     /// Bytes pushed here are written to the client's socket by its own task.
-    pub tx: UnboundedSender<Vec<u8>>,
+    pub tx: Sender<Vec<u8>>,
 }
 
 impl ClientHandle {
-    pub fn new(tx: UnboundedSender<Vec<u8>>) -> Self {
+    pub fn new(tx: Sender<Vec<u8>>) -> Self {
         ClientHandle {
             username: None,
             udp_token: None,
@@ -115,7 +122,12 @@ impl State {
                 continue;
             }
             let id = other.take_server_msg_id();
-            let _ = other.tx.send(frame(id, msg_type, payload));
+            if other.tx.try_send(frame(id, msg_type, payload)).is_err() {
+                debug!(
+                    client = other_id,
+                    "Outbox full or closed; dropped broadcast"
+                );
+            }
         }
     }
 }

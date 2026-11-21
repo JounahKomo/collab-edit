@@ -42,6 +42,34 @@ The server code is split into modules as well:
 - **`udp.rs`:** UDP hello and cursor handling, the periodic cursor snapshot, and the UDP tasks.
 - **`tls.rs`:** Loading of the TLS certificate and key.
 
+### Robustness and limits
+
+The server must keep running whatever clients send. Every connection is its own task, so one misbehaving client cannot block or crash the others, and its registry entry is released on every exit path (a drop guard, so even a panic frees the username). Malformed input is answered with `ERR` instead of panicking. The following limits apply:
+
+| Limit | Value | Behaviour when exceeded |
+| --- | --- | --- |
+| Frame size | 64 KiB (`MAX_FRAME_LEN`) | Connection is closed; the frame is never buffered |
+| Frame length shorter than the 12-byte header | - | Connection is closed |
+| Document length | 5,000 lines (`MAX_LINES`) | `ERR Document is too long`; nothing is modified |
+| Line width | 80 columns | `ERR Column exceeds maximum line width` |
+| TLS handshake | 10 s | Connection is dropped |
+| Registration (`USR`) | 30 s after connecting | Connection is closed (registered clients may idle) |
+| Outgoing queue per client | 256 frames | Further broadcasts to that client are dropped until it reads again; document snapshots are full state, so the next one repairs the loss |
+
+### Logging
+
+Logging uses `tracing`; the level is set with `RUST_LOG` (default `info`). Each connection logs inside a span carrying its client ID and peer address.
+
+* `error`: server faults (failed accept, serialization failures).
+* `warn`: protocol violations, I/O and TLS failures, unregistered connections timing out.
+* `info`: startup, connections opening and closing, user registration, channel creation, UDP endpoint binding.
+* `debug`: every handled request and every request rejected because of a client mistake (bad syntax, taken username).
+* `trace`: individual UDP datagrams.
+
+### Testing
+
+`cargo test` runs the unit tests (document model, framing, request handlers, UDP cursor handling) and the integration tests in `server/tests/integration.rs`. The integration tests start a real server in-process on loopback ports and drive it through sockets: registration and error replies, edit and chat broadcasts, hostile inputs (huge line numbers, oversized and garbage frames), username release after a disconnect, the registration timeout, 100 simultaneous clients, UDP cursor relay and metrics. The `testclient` binary (`cargo run -p client --bin testclient -- --no-tls --protocol komon-3`) runs the same kind of checks against an already running server and is also used for benchmarking.
+
 ## Protocol Specification
 
 Communication between clients and the server follows a binary-framed protocol over TCP/TLS:

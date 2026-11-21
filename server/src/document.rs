@@ -2,6 +2,10 @@
 /// on a standard document page with 1-inch margins (~80 characters).
 pub const MAX_COLUMNS: usize = 80;
 
+/// Maximum number of lines in the document (~140 pages). Bounds memory use and
+/// keeps every edit cheap, no matter what line numbers clients send.
+pub const MAX_LINES: usize = 5_000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Document {
     pub revision: u64,
@@ -39,6 +43,15 @@ impl Document {
     pub fn insert(&mut self, line: usize, col: usize, text: &str) -> Result<(), &'static str> {
         if col > MAX_COLUMNS {
             return Err("Column exceeds maximum line width");
+        }
+
+        // Reject edits that would grow the document past MAX_LINES. This is checked
+        // before anything is modified; the estimate counts the lines the target
+        // line, the inserted newlines and the wrapped overflow can add.
+        let newlines = text.matches('\n').count();
+        let wrapped = text.chars().count() / MAX_COLUMNS + 1;
+        if line >= MAX_LINES || self.lines.len().max(line + 1) + newlines + wrapped > MAX_LINES {
+            return Err("Document is too long");
         }
 
         // Auto-grow lines if target line is beyond current line count
@@ -215,6 +228,30 @@ mod tests {
             doc.insert(0, MAX_COLUMNS + 1, "b"),
             Err("Column exceeds maximum line width")
         );
+    }
+
+    #[test]
+    fn test_huge_line_numbers_are_rejected_without_growing() {
+        let mut doc = Document::new();
+        assert_eq!(doc.insert(usize::MAX, 0, "x"), Err("Document is too long"));
+        assert_eq!(doc.insert(MAX_LINES, 0, "x"), Err("Document is too long"));
+        assert_eq!(doc.insert(100_000_000, 0, "x"), Err("Document is too long"));
+        assert_eq!(doc.lines.len(), 1);
+        assert_eq!(doc.revision, 0);
+        // Too many inserted newlines is rejected as well.
+        let text = "\n".repeat(MAX_LINES);
+        assert_eq!(doc.insert(0, 0, &text), Err("Document is too long"));
+        assert_eq!(doc.lines.len(), 1);
+        // The last allowed line works.
+        assert!(doc.insert(MAX_LINES - 10, 0, "ok").is_ok());
+    }
+
+    #[test]
+    fn test_huge_delete_arguments_are_rejected() {
+        let mut doc = Document::new();
+        assert!(doc.delete(usize::MAX, 0, 1).is_err());
+        assert!(doc.delete(0, 0, usize::MAX).is_err());
+        assert!(doc.delete(0, usize::MAX, 1).is_err());
     }
 
     #[test]

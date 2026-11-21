@@ -3,7 +3,7 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use tokio::net::UdpSocket;
-use tracing::{info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::{
     document::MAX_COLUMNS,
@@ -28,6 +28,7 @@ pub type Outgoing = (SocketAddr, Vec<u8>);
 /// Returns the datagrams to send.
 pub fn handle_udp_datagram(state: &mut State, src: SocketAddr, data: &[u8]) -> Vec<Outgoing> {
     state.metrics.messages_received += 1;
+    trace!(%src, len = data.len(), "UDP datagram");
 
     let reply = parse_frame(data)
         .and_then(|f| Some((f, std::str::from_utf8(f.payload).ok()?)))
@@ -38,6 +39,7 @@ pub fn handle_udp_datagram(state: &mut State, src: SocketAddr, data: &[u8]) -> V
         });
 
     reply.unwrap_or_else(|| {
+        debug!(%src, "Dropped invalid or unauthorised UDP datagram");
         state.metrics.errors += 1;
         Vec::new()
     })
