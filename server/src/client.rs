@@ -23,6 +23,11 @@ pub struct ServerMetrics {
 /// check username uniqueness and to broadcast messages.
 pub struct ClientHandle {
     pub username: Option<String>,
+    /// UDP endpoint registered via `UDP <port>`; only datagrams from exactly
+    /// this address are accepted as this client's cursor updates.
+    pub udp_addr: Option<SocketAddr>,
+    /// Last cursor position (line, col) reported over UDP.
+    pub cursor: Option<(usize, usize)>,
     pub next_server_msg_id: u32,
     /// Message IDs already in use on this connection: the ones the client has
     /// sent in its requests plus the ones the server has allocated. IDs are
@@ -36,6 +41,8 @@ impl ClientHandle {
     pub fn new(tx: UnboundedSender<Vec<u8>>) -> Self {
         ClientHandle {
             username: None,
+            udp_addr: None,
+            cursor: None,
             next_server_msg_id: 2,
             used_ids: HashSet::new(),
             tx,
@@ -245,6 +252,35 @@ impl Client {
                         ));
                         warn!("MSG not according to protocol");
                         metrics.errors += 1;
+                    }
+                }
+                b"UDP " => {
+                    let port = std::str::from_utf8(payload)
+                        .ok()
+                        .and_then(|p| p.trim().parse::<u16>().ok())
+                        .filter(|p| *p != 0);
+                    let registered = clients.get(&self.id).is_some_and(|c| c.username.is_some());
+                    match (registered, port) {
+                        (false, _) => {
+                            self.write_buf.extend_from_slice(&create_error(
+                                msg_id,
+                                "Not registered. Send USR first.",
+                            ));
+                            metrics.errors += 1;
+                        }
+                        (true, None) => {
+                            self.write_buf.extend_from_slice(&create_error(
+                                msg_id,
+                                "Invalid UDP syntax. Expected: <port>",
+                            ));
+                            metrics.errors += 1;
+                        }
+                        (true, Some(port)) => {
+                            if let Some(me) = clients.get_mut(&self.id) {
+                                me.udp_addr = Some(SocketAddr::new(self.address.ip(), port));
+                            }
+                            self.write_buf.extend_from_slice(&msg_bytes);
+                        }
                     }
                 }
                 b"GET " => {
@@ -465,6 +501,99 @@ impl Client {
     }
 }
 
+/// Handles one UDP datagram. Only `CUR <line> <col>` from an endpoint registered
+/// through the TCP `UDP <port>` message is accepted; anything else is dropped
+/// silently (UDP has no error channel). Returns the `CUR <username> <line> <col>`
+/// datagrams to send, one per other client with a registered UDP endpoint.
+pub fn handle_udp_datagram(
+    state: &mut State,
+    src: SocketAddr,
+    data: &[u8],
+) -> Vec<(SocketAddr, Vec<u8>)> {
+    let State {
+        clients, metrics, ..
+    } = state;
+    metrics.messages_received += 1;
+
+    let parsed = (|| {
+        if data.len() < 12 || u32::from_be_bytes(data[..4].try_into().ok()?) as usize != data.len()
+        {
+            return None;
+        }
+        if &data[8..12] != b"CUR " {
+            return None;
+        }
+        let text = std::str::from_utf8(&data[12..]).ok()?;
+        let mut parts = text.split_whitespace();
+        let line: usize = parts.next()?.parse().ok()?;
+        let col: usize = parts.next()?.parse().ok()?;
+        if parts.next().is_some() || col > crate::document::MAX_COLUMNS {
+            return None;
+        }
+        Some((line, col))
+    })();
+
+    let Some((line, col)) = parsed else {
+        metrics.errors += 1;
+        return Vec::new();
+    };
+
+    let Some((sender_id, username)) = clients
+        .iter()
+        .find(|(_, c)| c.udp_addr == Some(src))
+        .and_then(|(id, c)| Some((*id, c.username.clone()?)))
+    else {
+        metrics.errors += 1;
+        return Vec::new();
+    };
+
+    if let Some(me) = clients.get_mut(&sender_id) {
+        me.cursor = Some((line, col));
+    }
+
+    let payload = format!("{username} {line} {col}");
+    let mut out = Vec::new();
+    for (id, other) in clients.iter_mut() {
+        if *id == sender_id {
+            continue;
+        }
+        if let (Some(addr), Some(_)) = (other.udp_addr, &other.username) {
+            let msg_id = other.take_server_msg_id();
+            out.push((addr, frame(msg_id, b"CUR ", payload.as_bytes())));
+        }
+    }
+    out
+}
+
+/// Builds a snapshot of every known cursor for every client with a registered
+/// UDP endpoint (each recipient gets all cursors except its own). Sent
+/// periodically so late joiners and clients that lost datagrams catch up, and
+/// so clients can expire cursors of users that have left.
+pub fn cursor_snapshot(state: &mut State) -> Vec<(SocketAddr, Vec<u8>)> {
+    let cursors: Vec<(ClientId, String)> = state
+        .clients
+        .iter()
+        .filter_map(|(id, c)| {
+            let (line, col) = c.cursor?;
+            Some((*id, format!("{} {line} {col}", c.username.as_ref()?)))
+        })
+        .collect();
+
+    let mut out = Vec::new();
+    for (rid, recipient) in state.clients.iter_mut() {
+        let (Some(addr), Some(_)) = (recipient.udp_addr, &recipient.username) else {
+            continue;
+        };
+        for (cid, payload) in &cursors {
+            if cid != rid {
+                let msg_id = recipient.take_server_msg_id();
+                out.push((addr, frame(msg_id, b"CUR ", payload.as_bytes())));
+            }
+        }
+    }
+    out
+}
+
 /// Broadcasts a server-originated message to the sender and all other registered clients.
 fn broadcast_to_all(
     clients: &mut HashMap<ClientId, ClientHandle>,
@@ -594,6 +723,45 @@ mod tests {
             rx_b.try_recv().unwrap(),
             frame(2, b"MSG ", b"alice general hi")
         );
+    }
+
+    #[test]
+    fn udp_cur_relayed_to_other_registered_endpoints() {
+        let mut state = State::default();
+        let (tx_a, _rx_a) = mpsc::unbounded_channel();
+        let (tx_b, _rx_b) = mpsc::unbounded_channel();
+        state.clients.insert(1, ClientHandle::new(tx_a));
+        state.clients.insert(2, ClientHandle::new(tx_b));
+        let mut a = Client::new(1, "10.0.0.1:1000".parse().unwrap());
+        let mut b = Client::new(2, "10.0.0.2:2000".parse().unwrap());
+        a.read_buf.extend_from_slice(&frame(1, b"USR ", b"alice"));
+        b.read_buf.extend_from_slice(&frame(1, b"USR ", b"bob"));
+        a.read_buf.extend_from_slice(&frame(3, b"UDP ", b"7001"));
+        b.read_buf.extend_from_slice(&frame(3, b"UDP ", b"7002"));
+        a.process_messages(&mut state);
+        b.process_messages(&mut state);
+        assert_eq!(
+            a.write_buf,
+            [frame(1, b"USR ", b"alice"), frame(3, b"UDP ", b"7001")].concat()
+        );
+
+        let a_udp: SocketAddr = "10.0.0.1:7001".parse().unwrap();
+        let out = handle_udp_datagram(&mut state, a_udp, &frame(1, b"CUR ", b"4 12"));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "10.0.0.2:7002".parse().unwrap());
+        assert_eq!(&out[0].1[12..], b"alice 4 12");
+
+        // Spoofed source, bad column and malformed frames are dropped.
+        let spoof: SocketAddr = "10.0.0.9:7001".parse().unwrap();
+        assert!(handle_udp_datagram(&mut state, spoof, &frame(1, b"CUR ", b"4 12")).is_empty());
+        assert!(handle_udp_datagram(&mut state, a_udp, &frame(1, b"CUR ", b"4 81")).is_empty());
+        assert!(handle_udp_datagram(&mut state, a_udp, b"junk").is_empty());
+
+        // Snapshot: bob has no cursor yet, so only he receives alice's.
+        let snap = cursor_snapshot(&mut state);
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].0, "10.0.0.2:7002".parse().unwrap());
+        assert_eq!(&snap[0].1[12..], b"alice 4 12");
     }
 
     #[test]

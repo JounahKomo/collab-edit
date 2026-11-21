@@ -12,6 +12,6 @@ WORKDIR /usr/local/bin
 
 COPY --from=builder /usr/src/pronets-app/target/release/server ./server
 
-EXPOSE 5011
+EXPOSE 5011/tcp 5011/udp
 
 CMD ["./server", "--port", "5011"]

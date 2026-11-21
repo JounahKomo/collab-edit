@@ -17,6 +17,13 @@ export struct ChatMessage {
     text: string,
 }
 
+export struct RemoteCursor {
+    username: string,
+    line: int,
+    col: int,
+    color: color,
+}
+
 export component AppWindow inherits Window {
     title: "CollabEdit - Collaborative Document Editor & Chat";
     preferred-width: 1350px;
@@ -25,6 +32,7 @@ export component AppWindow inherits Window {
 
     // Document properties
     in-out property <[PageData]> pages: [];
+    in-out property <[RemoteCursor]> remote-cursors: [];
     in-out property <int> cursor-line: 0;
     in-out property <int> cursor-col: 0;
     in-out property <string> line-prefix: "";
@@ -392,6 +400,32 @@ export component AppWindow inherits Window {
                                             width: 100%;
                                             wrap: no-wrap;
                                             overflow: clip;
+                                        }
+
+                                        // Cursors of the other users on this line
+                                        for rc in root.remote-cursors: Rectangle {
+                                            if rc.line == line.global_idx: Rectangle {
+                                                x: rc.col * 9.02px;
+                                                width: 2px;
+                                                height: 19px;
+                                                background: rc.color;
+
+                                                Rectangle {
+                                                    x: 0px;
+                                                    y: -11px;
+                                                    height: 11px;
+                                                    width: name-label.preferred-width + 6px;
+                                                    background: rc.color;
+                                                    border-radius: 2px;
+                                                    name-label := Text {
+                                                        text: rc.username;
+                                                        font-size: 9px;
+                                                        color: #ffffff;
+                                                        x: 3px;
+                                                        vertical-alignment: center;
+                                                    }
+                                                }
+                                            }
                                         }
 
                                         TouchArea {

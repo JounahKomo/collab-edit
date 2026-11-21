@@ -10,14 +10,16 @@ use clap::Parser;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::TcpListener,
+    net::{TcpListener, UdpSocket},
     sync::mpsc,
 };
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use server::client::{Client, ClientHandle, ClientId, SharedState};
+use server::client::{
+    Client, ClientHandle, ClientId, SharedState, cursor_snapshot, handle_udp_datagram,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -89,6 +91,47 @@ async fn main() -> io::Result<()> {
         .inspect_err(|e| error!("Failed to bind TCP listener to {address}: {e}"))?;
 
     let state = SharedState::default();
+
+    // Cursor updates (`CUR`) travel over UDP on the same port number as TCP.
+    let udp = Arc::new(
+        UdpSocket::bind(address)
+            .await
+            .inspect_err(|e| error!("Failed to bind UDP socket to {address}: {e}"))?,
+    );
+    {
+        let udp = udp.clone();
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                tick.tick().await;
+                let out = cursor_snapshot(&mut state.lock());
+                for (addr, data) in out {
+                    let _ = udp.send_to(&data, addr).await;
+                }
+            }
+        });
+    }
+    {
+        let udp = udp.clone();
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            loop {
+                match udp.recv_from(&mut buf).await {
+                    Ok((n, src)) => {
+                        let out = handle_udp_datagram(&mut state.lock(), src, &buf[..n]);
+                        for (addr, data) in out {
+                            if let Err(e) = udp.send_to(&data, addr).await {
+                                warn!("Failed sending UDP datagram to {addr}: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => warn!("UDP receive error: {e}"),
+                }
+            }
+        });
+    }
     let mut next_client_id: ClientId = 1;
 
     info!(

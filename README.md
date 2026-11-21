@@ -4,7 +4,7 @@
 
 The project is a real-time collaborative document editor written in Rust. It enables multiple concurrent users to connect over an encrypted network connection (TLS) to collaboratively view, edit, and interact on a shared text document simultaneously. The core goal is to provide a responsive, synchronized multi-user editing experience with minimal latency and strict consistency.
 
-The editor organizes text as a free-form document grid constrained to a standard page width (fixed at 80 columns, representative of font size 12 on standard margins). Key features include live text insertion and deletion, automatic line expansion, line wrapping at column 80, document revision tracking, full-state synchronization broadcasts on updates, and chat communication across channels. In future iterations, the editor will also display real-time interactive remote cursors showing peer positions.
+The editor organizes text as a free-form document grid constrained to a standard page width (fixed at 80 columns, representative of font size 12 on standard margins). Key features include live text insertion and deletion, automatic line expansion, line wrapping at column 80, document revision tracking, full-state synchronization broadcasts on updates, and chat communication across channels. Real-time remote cursors of all peers are displayed in the document, shared over UDP.
 
 ## Clients
 
@@ -18,6 +18,7 @@ Under the hood, the client architecture is modularly separated:
 - **UI Layer (`ui/app-window.slint`):** Handles visual styling, login prompt dialog, channels sidebar with dynamic channel creation dialog, multi-page document layout with page sheets and dropshadows, channel-filtered chat history and input bar, mouse click coordinate translation, and keyboard event capture (keystrokes, Enter line splits, Backspace deletions, and arrow key navigation).
 - **Document State (`doc_state.rs`):** Tracks local document lines, cursor coordinates, and revision numbers, handling optimistic local line-splitting, cascading line wrapping past column 80, line-merging, direct cursor repositioning (`set_cursor_pos`), and server revision state reconciliation.
 - **Chat State (`main.rs` - `ClientChatState`):** Tracks registered channels, active channel selection, and incoming chat messages, ensuring channel lists and active channel message views stay synchronized with server broadcasts.
+- **Cursor Sharing (`cursors.rs`):** Sends the local cursor over UDP whenever it moves, receives the other users' cursors, expires stale ones, and feeds them to the UI, which draws a coloured cursor bar with a name tag per remote user.
 - **Networking Layer (`net.rs`):** Abstracts TLS (`rustls`) and plain TCP stream handling, connection establishment, certificate validation, and binary frame encoding/decoding.
 - **Application Controller (`main.rs`):** Chunks linear document lines into page data (`LINES_PER_PAGE = 35`), wires click, keyboard, channel selection, and chat message callbacks, runs the background I/O worker thread, and bridges network events to the Slint UI thread via `slint::invoke_from_event_loop`.
 
@@ -52,9 +53,13 @@ The current protocol version is **`komon-2`** and it is backwards compatible wit
 * **`DEL ` (Delete Text):**
   * *Client -> Server:* `DEL <line> <col> <count>`
   * *Response:* Echoes the `DEL` frame back on success (and triggers a document `GET` broadcast), or returns `ERR` if the coordinates or count are invalid.
-* **`CUR ` (Interactive Cursor - Planned):**
-  * *Client -> Server:* `CUR <line> <col>`
-  * *Broadcast:* `CUR <username> <line> <col>` sent to other peers to display live cursor locations on their screen.
+* **`UDP ` (UDP Endpoint Registration):**
+  * *Client -> Server (TCP):* `UDP <port>`, sent after `USR`. Declares the local UDP port the client will send cursor updates from and receive them on; the IP is taken from the TCP connection.
+  * *Response:* Echoes on success, or `ERR` if not registered or the port is invalid.
+* **`CUR ` (Interactive Cursor, UDP):**
+  * Sent over **UDP** to the server's port (same number as the TCP port), using the same frame layout as TCP (the frame length must equal the datagram size). Cursor updates are best-effort: lost or reordered datagrams are tolerated, and invalid datagrams are dropped silently.
+  * *Client -> Server:* `CUR <line> <col>` from the endpoint registered with `UDP <port>` (datagrams from any other source address are ignored).
+  * *Broadcast:* `CUR <username> <line> <col>` sent as a datagram to the registered UDP endpoint of every other client, using server-allocated message IDs. The server also keeps each client's last cursor and re-sends a snapshot of all cursors to every registered client once per second, so late joiners and clients that lost datagrams catch up. Clients drop a remote cursor not refreshed for 5 seconds (this is how departed users disappear).
 * **`MSG ` (Chat / Messaging with Multi-Channel Support):**
   * *Client -> Server:* `MSG <channel> <message>`
   * *Behavior:* If `<channel>` is not yet recognized by the server, the server dynamically creates a channel with that name.
