@@ -33,9 +33,9 @@ While the graphical client is focused on direct user interaction, the architectu
 Communication between clients and the server follows a binary-framed protocol over TCP/TLS:
 `[4 bytes length (BE)] [4 bytes message_id (BE)] [4 bytes type] [payload]`
 
-The current protocol version is **`komon-2`** and it is backwards compatible with `komon-1` and the `base-protocol`. The change introduced in `komon-2` is full support for multiple channels, dynamically creating channels whenever an `MSG` is sent to an unrecognized channel name.
+The current protocol version is **`komon-3`** and it is backwards compatible with `komon-2`, `komon-1` and the `base-protocol`. The change introduced in `komon-3` is live remote cursors: the new `UDP ` registration message and the `CUR ` cursor message, which is carried over **UDP** instead of the TCP/TLS connection (see below). All other messages are unchanged. `komon-2` added full support for multiple channels, dynamically creating channels whenever an `MSG` is sent to an unrecognized channel name.
 
-### Current and Planned Messages
+### Messages
 
 * **`TST ` (Echo / Ping):**
   * *Client -> Server:* `TST <payload>`
@@ -53,11 +53,11 @@ The current protocol version is **`komon-2`** and it is backwards compatible wit
 * **`DEL ` (Delete Text):**
   * *Client -> Server:* `DEL <line> <col> <count>`
   * *Response:* Echoes the `DEL` frame back on success (and triggers a document `GET` broadcast), or returns `ERR` if the coordinates or count are invalid.
-* **`UDP ` (UDP Endpoint Registration):**
+* **`UDP ` (UDP Endpoint Registration, `komon-3`):**
   * *Client -> Server (TCP):* `UDP <token>`, sent after `USR`. Announces a random token (no spaces, max 64 bytes) for this connection.
   * *Response:* Echoes on success, or `ERR` if not registered or the token is invalid.
   * *Client -> Server (UDP hello):* the client then sends a datagram `UDP <token>` to the server's UDP port, repeating until acknowledged. The server binds the datagram's real source address to the client that announced the token and replies with an empty `UDP ` datagram. Learning the address from the datagram itself makes this work through NAT (e.g. Docker).
-* **`CUR ` (Interactive Cursor, UDP):**
+* **`CUR ` (Interactive Cursor, UDP, `komon-3`):**
   * Sent over **UDP** to the server's port (same number as the TCP port), using the same frame layout as TCP (the frame length must equal the datagram size). Cursor updates are best-effort: lost or reordered datagrams are tolerated, and invalid datagrams are dropped silently.
   * *Client -> Server:* `CUR <line> <col>` from the endpoint bound by the `UDP` hello (datagrams from any other source address are ignored).
   * *Broadcast:* `CUR <username> <line> <col>` sent as a datagram to the registered UDP endpoint of every other client, using server-allocated message IDs. The server also keeps each client's last cursor and re-sends a snapshot of all cursors to every registered client once per second, so late joiners and clients that lost datagrams catch up. Clients drop a remote cursor not refreshed for 5 seconds (this is how departed users disappear).
