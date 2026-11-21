@@ -58,8 +58,17 @@ impl ClientContext {
     }
 
     /// Generates a unique client message ID and queues a frame to be sent to the server.
-    pub fn send_frame(&self, msg_type: &[u8; 4], payload: &str) {
-        let frame = make_frame(next_msg_id(&self.msg_counter), msg_type, payload);
-        let _ = self.tx_net.send(frame);
+    pub fn send_frame(&self, msg_type: &[u8; 4], payload: &str) -> u32 {
+        let id = next_msg_id(&self.msg_counter);
+        let _ = self.tx_net.send(make_frame(id, msg_type, payload));
+        id
+    }
+
+    /// Sends an INS/DEL request that was already applied locally, remembering it
+    /// so stale server snapshots are not applied before the server answers.
+    pub fn send_edit(&self, msg_type: &[u8; 4], payload: &str) {
+        let mut st = self.doc_state.lock().unwrap();
+        let id = self.send_frame(msg_type, payload);
+        st.edit_sent(id);
     }
 }

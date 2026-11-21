@@ -1,5 +1,7 @@
 //! Document state management for the CollabEdit client.
 
+use std::collections::HashSet;
+
 /// Maximum number of characters (columns) per line, matching the server's limit.
 pub const MAX_COLUMNS: usize = 80;
 
@@ -9,6 +11,9 @@ pub struct ClientDocState {
     pub cursor_line: usize,
     pub cursor_col: usize,
     pub revision: u32,
+    /// IDs of INS/DEL requests applied locally but not yet answered by the
+    /// server. While any are outstanding the local text is ahead of the server's.
+    pending_edit_ids: HashSet<u32>,
 }
 
 impl Default for ClientDocState {
@@ -25,12 +30,35 @@ impl ClientDocState {
             cursor_line: 0,
             cursor_col: 0,
             revision: 0,
+            pending_edit_ids: HashSet::new(),
         }
+    }
+
+    /// Records that the INS/DEL request with this ID was sent.
+    pub fn edit_sent(&mut self, msg_id: u32) {
+        self.pending_edit_ids.insert(msg_id);
+    }
+
+    /// Records the server's answer (echo or error) to a request. Returns true
+    /// if it answered one of our outstanding edits.
+    pub fn edit_answered(&mut self, msg_id: u32) -> bool {
+        self.pending_edit_ids.remove(&msg_id)
+    }
+
+    pub fn has_pending_edits(&self) -> bool {
+        !self.pending_edit_ids.is_empty()
     }
 
     /// Replaces the document content and revision with state received from the server,
     /// clamping the current user cursor within the new boundaries.
-    pub fn update_from_server(&mut self, revision: u32, content: &str) {
+    ///
+    /// Returns false (and changes nothing) while local edits are unanswered: such a
+    /// snapshot predates them and would make freshly typed text vanish and the
+    /// cursor run ahead. The snapshot that follows the last answered edit applies.
+    pub fn update_from_server(&mut self, revision: u32, content: &str) -> bool {
+        if self.has_pending_edits() {
+            return false;
+        }
         self.revision = revision;
         let mut new_lines: Vec<String> = content.split('\n').map(|s| s.to_string()).collect();
         if new_lines.is_empty() {
@@ -38,6 +66,7 @@ impl ClientDocState {
         }
         self.lines = new_lines;
         self.clamp_cursor();
+        true
     }
 
     /// Ensures cursor coordinates do not point outside the current lines vector or column lengths.
@@ -210,6 +239,26 @@ impl ClientDocState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_snapshots_are_ignored_while_edits_are_pending() {
+        let mut state = ClientDocState::new();
+        state.insert_text("a");
+        state.edit_sent(1);
+        state.insert_text("b");
+        state.edit_sent(3);
+
+        // Snapshot for the first edit arrives after both keystrokes were typed.
+        assert!(state.edit_answered(1));
+        assert!(!state.update_from_server(1, "a"));
+        assert_eq!(state.lines[0], "ab");
+
+        // Once the last edit is answered the snapshot applies.
+        assert!(state.edit_answered(3));
+        assert!(!state.edit_answered(3));
+        assert!(state.update_from_server(2, "ab"));
+        assert_eq!(state.revision, 2);
+    }
 
     #[test]
     fn test_initial_state() {

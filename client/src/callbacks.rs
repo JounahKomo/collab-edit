@@ -23,7 +23,7 @@ pub fn register_ui_callbacks(ui: &AppWindow, ctx: ClientContext) {
             st.insert_text(&text);
             (line, col)
         });
-        ctx_key.send_frame(b"INS ", &format!("{} {} {}", line, col, text));
+        ctx_key.send_edit(b"INS ", &format!("{} {} {}", line, col, text));
     });
 
     let ctx_enter = ctx.clone();
@@ -34,14 +34,14 @@ pub fn register_ui_callbacks(ui: &AppWindow, ctx: ClientContext) {
             st.insert_newline();
             (line, col)
         });
-        ctx_enter.send_frame(b"INS ", &format!("{} {} \n", line, col));
+        ctx_enter.send_edit(b"INS ", &format!("{} {} \n", line, col));
     });
 
     let ctx_backspace = ctx.clone();
     ui.on_backspace_pressed(move || {
         let del_op = ctx_backspace.with_doc_state_mut(|st| st.backspace());
         if let Some((line, col, count)) = del_op {
-            ctx_backspace.send_frame(b"DEL ", &format!("{} {} {}", line, col, count));
+            ctx_backspace.send_edit(b"DEL ", &format!("{} {} {}", line, col, count));
         }
     });
 

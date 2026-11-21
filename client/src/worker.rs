@@ -72,8 +72,8 @@ fn run(mut stream: ConnectionStream, rx_net: mpsc::Receiver<Vec<u8>>, ctx: Worke
             }
         }
 
-        while let Some((msg_type, payload)) = take_frame(&mut read_buf) {
-            handle_frame(&mut stream, &ctx, &msg_type, &payload);
+        while let Some((id, msg_type, payload)) = take_frame(&mut read_buf) {
+            handle_frame(&mut stream, &ctx, id, &msg_type, &payload);
         }
     }
 }
@@ -115,7 +115,7 @@ fn read_available(stream: &mut ConnectionStream, read_buf: &mut Vec<u8>) -> Read
 
 /// Removes the next complete frame from the buffer, returning its type and
 /// payload (lossily decoded as UTF-8).
-fn take_frame(read_buf: &mut Vec<u8>) -> Option<([u8; 4], String)> {
+fn take_frame(read_buf: &mut Vec<u8>) -> Option<(u32, [u8; 4], String)> {
     if read_buf.len() < HEADER_LEN {
         return None;
     }
@@ -128,24 +128,40 @@ fn take_frame(read_buf: &mut Vec<u8>) -> Option<([u8; 4], String)> {
     if read_buf.len() < length {
         return None;
     }
+    let id = u32::from_be_bytes(read_buf[4..8].try_into().unwrap());
     let msg_type: [u8; 4] = read_buf[8..HEADER_LEN].try_into().unwrap();
     let payload = String::from_utf8_lossy(&read_buf[HEADER_LEN..length]).to_string();
     read_buf.drain(0..length);
-    Some((msg_type, payload))
+    Some((id, msg_type, payload))
 }
 
 fn handle_frame(
     stream: &mut ConnectionStream,
     ctx: &WorkerContext,
+    id: u32,
     msg_type: &[u8; 4],
     payload: &str,
 ) {
+    if matches!(msg_type, b"INS " | b"DEL " | b"ERR ") {
+        on_edit_answered(stream, ctx, id, msg_type == b"ERR ");
+    }
     match msg_type {
         b"USR " => on_login_confirmed(stream, ctx, payload.trim()),
         b"GET " => on_document(ctx, payload),
         b"MSG " => on_chat_message(ctx, payload),
         b"ERR " => on_error(ctx, payload),
         _ => {}
+    }
+}
+
+/// An INS/DEL echo (or an error) answers one of our outstanding edits. If the
+/// server rejected the edit our local text is wrong, so ask for the real document.
+fn on_edit_answered(stream: &mut ConnectionStream, ctx: &WorkerContext, id: u32, rejected: bool) {
+    let answered = ctx.doc_state.lock().unwrap().edit_answered(id);
+    if answered && rejected {
+        let frame = make_frame(next_msg_id(&ctx.msg_counter), b"GET ", "");
+        let _ = stream.write_all(&frame);
+        let _ = stream.flush();
     }
 }
 
@@ -187,7 +203,9 @@ fn on_document(ctx: &WorkerContext, payload: &str) {
 
     {
         let mut st = ctx.doc_state.lock().unwrap();
-        st.update_from_server(rev, content);
+        if !st.update_from_server(rev, content) {
+            return;
+        }
         ctx.cursor_sender
             .send_if_changed(st.cursor_line, st.cursor_col);
     }
