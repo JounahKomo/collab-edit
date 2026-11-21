@@ -23,8 +23,11 @@ pub struct ServerMetrics {
 /// check username uniqueness and to broadcast messages.
 pub struct ClientHandle {
     pub username: Option<String>,
-    /// UDP endpoint registered via `UDP <port>`; only datagrams from exactly
-    /// this address are accepted as this client's cursor updates.
+    /// Token announced over TCP with `UDP <token>`; a hello datagram carrying
+    /// it binds the datagram's real source address to this client.
+    pub udp_token: Option<String>,
+    /// UDP endpoint learned from the hello datagram (works through NAT); only
+    /// datagrams from exactly this address count as this client's cursor.
     pub udp_addr: Option<SocketAddr>,
     /// Last cursor position (line, col) reported over UDP.
     pub cursor: Option<(usize, usize)>,
@@ -41,6 +44,7 @@ impl ClientHandle {
     pub fn new(tx: UnboundedSender<Vec<u8>>) -> Self {
         ClientHandle {
             username: None,
+            udp_token: None,
             udp_addr: None,
             cursor: None,
             next_server_msg_id: 2,
@@ -255,12 +259,12 @@ impl Client {
                     }
                 }
                 b"UDP " => {
-                    let port = std::str::from_utf8(payload)
+                    let token = std::str::from_utf8(payload)
                         .ok()
-                        .and_then(|p| p.trim().parse::<u16>().ok())
-                        .filter(|p| *p != 0);
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty() && t.len() <= 64 && !t.contains(' '));
                     let registered = clients.get(&self.id).is_some_and(|c| c.username.is_some());
-                    match (registered, port) {
+                    match (registered, token) {
                         (false, _) => {
                             self.write_buf.extend_from_slice(&create_error(
                                 msg_id,
@@ -271,13 +275,14 @@ impl Client {
                         (true, None) => {
                             self.write_buf.extend_from_slice(&create_error(
                                 msg_id,
-                                "Invalid UDP syntax. Expected: <port>",
+                                "Invalid UDP syntax. Expected: <token>",
                             ));
                             metrics.errors += 1;
                         }
-                        (true, Some(port)) => {
+                        (true, Some(token)) => {
                             if let Some(me) = clients.get_mut(&self.id) {
-                                me.udp_addr = Some(SocketAddr::new(self.address.ip(), port));
+                                me.udp_token = Some(token.to_string());
+                                me.udp_addr = None;
                             }
                             self.write_buf.extend_from_slice(&msg_bytes);
                         }
@@ -501,10 +506,15 @@ impl Client {
     }
 }
 
-/// Handles one UDP datagram. Only `CUR <line> <col>` from an endpoint registered
-/// through the TCP `UDP <port>` message is accepted; anything else is dropped
-/// silently (UDP has no error channel). Returns the `CUR <username> <line> <col>`
-/// datagrams to send, one per other client with a registered UDP endpoint.
+/// Handles one UDP datagram; anything invalid is dropped silently (UDP has no
+/// error channel). Two kinds are accepted:
+/// * `UDP <token>` hello: binds the datagram's source address to the client that
+///   announced the token over TCP, and is acknowledged with a `UDP ` datagram.
+///   Learning the address from the datagram itself makes this work through NAT.
+/// * `CUR <line> <col>` from a bound address: stored and relayed as
+///   `CUR <username> <line> <col>` to every other client with a bound endpoint.
+///
+/// Returns the datagrams to send.
 pub fn handle_udp_datagram(
     state: &mut State,
     src: SocketAddr,
@@ -515,15 +525,43 @@ pub fn handle_udp_datagram(
     } = state;
     metrics.messages_received += 1;
 
-    let parsed = (|| {
+    let header = (|| {
         if data.len() < 12 || u32::from_be_bytes(data[..4].try_into().ok()?) as usize != data.len()
         {
             return None;
         }
-        if &data[8..12] != b"CUR " {
+        let id = u32::from_be_bytes(data[4..8].try_into().ok()?);
+        Some((id, &data[8..12], std::str::from_utf8(&data[12..]).ok()?))
+    })();
+    let Some((msg_id, kind, text)) = header else {
+        metrics.errors += 1;
+        return Vec::new();
+    };
+
+    if kind == b"UDP " {
+        let token = text.trim();
+        let found = clients
+            .values_mut()
+            .find(|c| c.username.is_some() && c.udp_token.as_deref() == Some(token));
+        return match found {
+            Some(c) => {
+                if c.udp_addr != Some(src) {
+                    tracing::info!("UDP endpoint for {:?} is {src}", c.username);
+                }
+                c.udp_addr = Some(src);
+                vec![(src, frame(msg_id, b"UDP ", b""))]
+            }
+            None => {
+                metrics.errors += 1;
+                Vec::new()
+            }
+        };
+    }
+
+    let parsed = (|| {
+        if kind != b"CUR " {
             return None;
         }
-        let text = std::str::from_utf8(&data[12..]).ok()?;
         let mut parts = text.split_whitespace();
         let line: usize = parts.next()?.parse().ok()?;
         let col: usize = parts.next()?.parse().ok()?;
@@ -736,19 +774,22 @@ mod tests {
         let mut b = Client::new(2, "10.0.0.2:2000".parse().unwrap());
         a.read_buf.extend_from_slice(&frame(1, b"USR ", b"alice"));
         b.read_buf.extend_from_slice(&frame(1, b"USR ", b"bob"));
-        a.read_buf.extend_from_slice(&frame(3, b"UDP ", b"7001"));
-        b.read_buf.extend_from_slice(&frame(3, b"UDP ", b"7002"));
+        a.read_buf.extend_from_slice(&frame(3, b"UDP ", b"tokA"));
+        b.read_buf.extend_from_slice(&frame(3, b"UDP ", b"tokB"));
         a.process_messages(&mut state);
         b.process_messages(&mut state);
-        assert_eq!(
-            a.write_buf,
-            [frame(1, b"USR ", b"alice"), frame(3, b"UDP ", b"7001")].concat()
-        );
 
-        let a_udp: SocketAddr = "10.0.0.1:7001".parse().unwrap();
+        // Hello datagrams bind the real (NATed) source addresses.
+        let a_udp: SocketAddr = "192.168.65.1:41000".parse().unwrap();
+        let b_udp: SocketAddr = "192.168.65.1:41001".parse().unwrap();
+        let ack = handle_udp_datagram(&mut state, a_udp, &frame(5, b"UDP ", b"tokA"));
+        assert_eq!(ack, vec![(a_udp, frame(5, b"UDP ", b""))]);
+        handle_udp_datagram(&mut state, b_udp, &frame(5, b"UDP ", b"tokB"));
+        assert!(handle_udp_datagram(&mut state, a_udp, &frame(5, b"UDP ", b"nope")).is_empty());
+
         let out = handle_udp_datagram(&mut state, a_udp, &frame(1, b"CUR ", b"4 12"));
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].0, "10.0.0.2:7002".parse().unwrap());
+        assert_eq!(out[0].0, b_udp);
         assert_eq!(&out[0].1[12..], b"alice 4 12");
 
         // Spoofed source, bad column and malformed frames are dropped.
@@ -760,7 +801,7 @@ mod tests {
         // Snapshot: bob has no cursor yet, so only he receives alice's.
         let snap = cursor_snapshot(&mut state);
         assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].0, "10.0.0.2:7002".parse().unwrap());
+        assert_eq!(snap[0].0, b_udp);
         assert_eq!(&snap[0].1[12..], b"alice 4 12");
     }
 

@@ -204,7 +204,7 @@ fn start_network_worker(
     doc_state_net: Arc<Mutex<ClientDocState>>,
     chat_state_net: Arc<Mutex<ClientChatState>>,
     cursor_sender: Arc<CursorSender>,
-    udp_port: u16,
+    udp_token: Arc<Mutex<Option<String>>>,
     msg_counter: Arc<AtomicU32>,
     own_name: Arc<Mutex<String>>,
 ) {
@@ -276,13 +276,19 @@ fn start_network_worker(
                 if msg_type == b"USR " {
                     let registered_user = payload.trim().to_string();
                     *own_name.lock().unwrap() = registered_user.clone();
-                    // Tell the server which UDP port to use for cursor updates.
+                    // Announce a token; the hello datagram carrying it (sent by the
+                    // cursor thread) lets the server learn our UDP address.
                     {
                         use std::io::Write;
-                        let reg =
-                            make_frame(next_msg_id(&msg_counter), b"UDP ", &udp_port.to_string());
+                        let nanos = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos())
+                            .unwrap_or(0);
+                        let token = format!("{:x}-{:x}", std::process::id(), nanos);
+                        let reg = make_frame(next_msg_id(&msg_counter), b"UDP ", &token);
                         let _ = stream.write_all(&reg);
                         let _ = stream.flush();
+                        *udp_token.lock().unwrap() = Some(token);
                     }
                     let ui_clone = ui_weak.clone();
                     let _ = slint::invoke_from_event_loop(move || {
@@ -294,9 +300,7 @@ fn start_network_worker(
                         }
                     });
                 } else if msg_type == b"UDP " {
-                    cursor_sender.mark_registered();
-                    let st = doc_state_net.lock().unwrap();
-                    cursor_sender.send_if_changed(st.cursor_line, st.cursor_col);
+                    // TCP echo of our token announcement; nothing to do.
                 } else if msg_type == b"GET " {
                     let (rev, content) = if let Some((rev_str, text)) = payload.split_once('\n') {
                         (rev_str.parse::<u32>().ok(), text)
@@ -472,10 +476,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let udp_socket = Arc::new(std::net::UdpSocket::bind(bind_addr)?);
     udp_socket.connect(server_addr)?;
-    let udp_port = udp_socket.local_addr()?.port();
     let cursor_sender = Arc::new(CursorSender::new(Arc::clone(&udp_socket)));
     let remote_cursors: RemoteCursors = Arc::default();
     let own_name = Arc::new(Mutex::new(String::new()));
+    let udp_token: Arc<Mutex<Option<String>>> = Arc::default();
 
     let ui = AppWindow::new()?;
     let doc_state = Arc::new(Mutex::new(ClientDocState::new()));
@@ -521,11 +525,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&doc_state),
         Arc::clone(&chat_state),
         Arc::clone(&cursor_sender),
-        udp_port,
+        Arc::clone(&udp_token),
         Arc::clone(&msg_counter),
         Arc::clone(&own_name),
     );
-    start_cursor_receiver(udp_socket, ui.as_weak(), remote_cursors, own_name);
+    start_cursor_receiver(
+        udp_socket,
+        ui.as_weak(),
+        remote_cursors,
+        own_name,
+        Arc::clone(&cursor_sender),
+        udp_token,
+    );
 
     // Register user input event callbacks
     register_ui_callbacks(&ui, ctx.clone());

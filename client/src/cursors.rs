@@ -23,6 +23,8 @@ pub struct CursorSender {
     socket: Arc<UdpSocket>,
     registered: AtomicBool,
     last_sent: Mutex<Option<(usize, usize)>>,
+    /// Most recent local cursor, so it can be sent as soon as we are registered.
+    latest: Mutex<Option<(usize, usize)>>,
     msg_id: AtomicU32,
 }
 
@@ -32,17 +34,34 @@ impl CursorSender {
             socket,
             registered: AtomicBool::new(false),
             last_sent: Mutex::new(None),
+            latest: Mutex::new(None),
             msg_id: AtomicU32::new(1),
         }
     }
 
-    /// Called once the server has acknowledged `UDP <port>`.
+    /// Called once the server has acknowledged our hello datagram.
     pub fn mark_registered(&self) {
-        self.registered.store(true, Ordering::SeqCst);
+        if !self.registered.swap(true, Ordering::SeqCst) {
+            let latest = *self.latest.lock().unwrap();
+            if let Some((line, col)) = latest {
+                self.send_if_changed(line, col);
+            }
+        }
+    }
+
+    pub fn is_registered(&self) -> bool {
+        self.registered.load(Ordering::SeqCst)
+    }
+
+    /// Sends the hello datagram that lets the server learn our UDP address.
+    pub fn send_hello(&self, token: &str) {
+        let id = self.msg_id.fetch_add(2, Ordering::SeqCst);
+        let _ = self.socket.send(&make_frame(id, b"UDP ", token));
     }
 
     /// Sends the cursor if it moved since the last datagram (best effort).
     pub fn send_if_changed(&self, line: usize, col: usize) {
+        *self.latest.lock().unwrap() = Some((line, col));
         if !self.registered.load(Ordering::SeqCst) {
             return;
         }
@@ -58,6 +77,11 @@ impl CursorSender {
 }
 
 pub type RemoteCursors = Arc<Mutex<HashMap<String, (usize, usize, Instant)>>>;
+
+/// A datagram of type `UDP ` is the server's acknowledgement of our hello.
+fn is_hello_ack(data: &[u8]) -> bool {
+    data.len() >= 12 && &data[8..12] == b"UDP "
+}
 
 /// Parses a datagram `len|id|CUR |<username> <line> <col>`.
 fn parse_cursor(data: &[u8]) -> Option<(String, usize, usize)> {
@@ -118,13 +142,27 @@ pub fn start_cursor_receiver(
     ui_weak: slint::Weak<AppWindow>,
     cursors: RemoteCursors,
     own_name: Arc<Mutex<String>>,
+    sender: Arc<CursorSender>,
+    token: Arc<Mutex<Option<String>>>,
 ) {
     thread::spawn(move || {
         let _ = socket.set_read_timeout(Some(Duration::from_millis(500)));
         let mut buf = [0u8; 2048];
         loop {
             let mut changed = false;
-            if let Ok(n) = socket.recv(&mut buf)
+            // Until acknowledged, keep announcing ourselves (datagrams may be lost).
+            if !sender.is_registered()
+                && let Some(t) = token.lock().unwrap().as_deref()
+            {
+                sender.send_hello(t);
+            }
+            let received = socket.recv(&mut buf).ok();
+            if let Some(n) = received
+                && is_hello_ack(&buf[..n])
+            {
+                sender.mark_registered();
+            }
+            if let Some(n) = received
                 && let Some((user, line, col)) = parse_cursor(&buf[..n])
                 && user != *own_name.lock().unwrap()
             {

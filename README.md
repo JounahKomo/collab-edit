@@ -54,11 +54,12 @@ The current protocol version is **`komon-2`** and it is backwards compatible wit
   * *Client -> Server:* `DEL <line> <col> <count>`
   * *Response:* Echoes the `DEL` frame back on success (and triggers a document `GET` broadcast), or returns `ERR` if the coordinates or count are invalid.
 * **`UDP ` (UDP Endpoint Registration):**
-  * *Client -> Server (TCP):* `UDP <port>`, sent after `USR`. Declares the local UDP port the client will send cursor updates from and receive them on; the IP is taken from the TCP connection.
-  * *Response:* Echoes on success, or `ERR` if not registered or the port is invalid.
+  * *Client -> Server (TCP):* `UDP <token>`, sent after `USR`. Announces a random token (no spaces, max 64 bytes) for this connection.
+  * *Response:* Echoes on success, or `ERR` if not registered or the token is invalid.
+  * *Client -> Server (UDP hello):* the client then sends a datagram `UDP <token>` to the server's UDP port, repeating until acknowledged. The server binds the datagram's real source address to the client that announced the token and replies with an empty `UDP ` datagram. Learning the address from the datagram itself makes this work through NAT (e.g. Docker).
 * **`CUR ` (Interactive Cursor, UDP):**
   * Sent over **UDP** to the server's port (same number as the TCP port), using the same frame layout as TCP (the frame length must equal the datagram size). Cursor updates are best-effort: lost or reordered datagrams are tolerated, and invalid datagrams are dropped silently.
-  * *Client -> Server:* `CUR <line> <col>` from the endpoint registered with `UDP <port>` (datagrams from any other source address are ignored).
+  * *Client -> Server:* `CUR <line> <col>` from the endpoint bound by the `UDP` hello (datagrams from any other source address are ignored).
   * *Broadcast:* `CUR <username> <line> <col>` sent as a datagram to the registered UDP endpoint of every other client, using server-allocated message IDs. The server also keeps each client's last cursor and re-sends a snapshot of all cursors to every registered client once per second, so late joiners and clients that lost datagrams catch up. Clients drop a remote cursor not refreshed for 5 seconds (this is how departed users disappear).
 * **`MSG ` (Chat / Messaging with Multi-Channel Support):**
   * *Client -> Server:* `MSG <channel> <message>`
